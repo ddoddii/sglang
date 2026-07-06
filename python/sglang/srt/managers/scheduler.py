@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.idle_kv_parking import IdleKVParkManager
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -691,6 +692,24 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+
+        # Idle KV parking (PD): park a decode conversation's prefix KV into an idle
+        # prefill node's GPU over NVLink during tool-call idle windows so the next
+        # turn prefix-hits instead of recomputing. See idle_kv_parking.py.
+        if (
+            server_args.disaggregation_mode in ("prefill", "decode")
+            and server_args.disaggregation_enable_idle_kv_parking
+        ):
+            self.idle_kv_park_manager = IdleKVParkManager(
+                role=server_args.disaggregation_mode,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=params.tp_cache_group,
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.idle_kv_park_manager = None
 
         self.decode_mem_cache_buf_multiplier = (
             1

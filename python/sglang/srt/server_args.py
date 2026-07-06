@@ -615,6 +615,10 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    # Idle KV parking: during tool-call idle windows, park a decode conversation's
+    # prefix KV into an idle prefill node's GPU (NVLink) so the next turn prefix-hits
+    # instead of recomputing. See docs/developer_guide/idle_kv_parking_design.md.
+    disaggregation_enable_idle_kv_parking: bool = False
     # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
     disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
@@ -2378,6 +2382,13 @@ class ServerArgs:
             ):
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
+                )
+
+        if self.disaggregation_enable_idle_kv_parking:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "The argument disaggregation-enable-idle-kv-parking is only supported in PD "
+                    "disaggregation mode (--disaggregation-mode prefill|decode)."
                 )
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
@@ -4479,6 +4490,14 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-idle-kv-parking",
+            action="store_true",
+            help="Enable idle KV parking (PD mode): during tool-call idle windows, "
+            "park a decode conversation's prefix KV into an idle prefill node's GPU "
+            "over NVLink so the next turn prefix-hits instead of recomputing. "
+            "See docs/developer_guide/idle_kv_parking_design.md.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-fake-auto",
