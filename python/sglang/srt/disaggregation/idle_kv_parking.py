@@ -161,10 +161,12 @@ class IdleKVParkManager:
         verify_checksum = float(verify.double().sum().item())
         torch.cuda.synchronize(self.gpu_id)
 
-        # slice 2b: write a known per-slot pattern into free test slots across all
-        # layers so the prefill side can validate the indexed gather-copy.
+        # slice 2b: dedicated race-free test buffers (KV-shaped) with a known pattern,
+        # so the prefill side validates the multi-layer indexed gather-copy without
+        # racing the live pool (warmup/serving can overwrite live slots).
         st_indices = list(range(1, 1 + SELFTEST_N_SLOTS))
-        st_checksum = self._write_selftest_pattern(st_indices)
+        st_k, st_v, st_checksum = self._build_selftest_buffers(st_indices)
+        self._st_keepalive = (st_k, st_v)  # keep alive for the peer's lifetime
 
         payload = {
             "role": "decode",
@@ -180,6 +182,8 @@ class IdleKVParkManager:
             "v_handles": [_export_ipc(t) for t in self.v_buffer],
             "selftest_indices": st_indices,
             "selftest_checksum": st_checksum,
+            "st_k_handles": [_export_ipc(t) for t in st_k],
+            "st_v_handles": [_export_ipc(t) for t in st_v],
             "ts": time.time(),
         }
         # Keep verify alive for the peer's lifetime.
@@ -200,66 +204,84 @@ class IdleKVParkManager:
             DECODE_IPC_FILE,
         )
 
-    def _write_selftest_pattern(self, indices) -> float:
-        """Write a distinct small value into each test slot across all k/v layers.
-
-        Returns the total checksum (sum over all layers/slots/elements of k and v).
-        Values are small ints, exact in fp16/bf16. Safe on free startup slots.
-        """
-        idx = torch.tensor(indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
-        vals = ((idx % 50) + 1).to(self.k_buffer[0].dtype)  # [N]
+    def _build_selftest_buffers(self, indices):
+        """Allocate dedicated KV-shaped test buffers, write a known per-slot pattern,
+        and return (k_bufs, v_bufs, checksum). Race-free: nothing else touches them."""
+        head_num, head_dim = self.k_buffer[0].shape[1], self.k_buffer[0].shape[2]
+        dtype = self.k_buffer[0].dtype
+        dev = f"cuda:{self.gpu_id}"
+        n = max(indices) + 1
+        k_bufs = [torch.zeros(n, head_num, head_dim, dtype=dtype, device=dev) for _ in self.k_buffer]
+        v_bufs = [torch.zeros(n, head_num, head_dim, dtype=dtype, device=dev) for _ in self.v_buffer]
+        idx = torch.tensor(indices, dtype=torch.long, device=dev)
+        vals = ((idx % 50) + 1).to(dtype)  # small ints, exact in fp16/bf16
         total = 0.0
-        for layer in range(len(self.k_buffer)):
-            for buf in (self.k_buffer[layer], self.v_buffer[layer]):
-                # buf[idx] shape: [N, head_num, head_dim]; broadcast per-slot value.
+        for layer in range(len(k_bufs)):
+            for buf in (k_bufs[layer], v_bufs[layer]):
                 buf[idx] = vals.view(-1, *([1] * (buf.dim() - 1)))
                 total += float(buf[idx].float().sum().item())
         torch.cuda.synchronize(self.gpu_id)
-        return total
+        return k_bufs, v_bufs, total
 
-    def _gather_copy_from_peer(self, src_indices, dst_indices) -> None:
-        """Copy KV slots src_indices (peer/D pool) -> dst_indices (local pool),
-        across all layers, over NVLink P2P. Reusable by the real park path (slice 3)."""
+    def _p2p_gather(self, src_k, src_v, dst_k, dst_v, src_indices, dst_indices) -> None:
+        """Copy slots src_indices (src_k/src_v, peer device) -> dst_indices
+        (dst_k/dst_v, local device) across all layers over NVLink P2P.
+
+        Cross-device indexed assignment is unsupported, so gather on the peer device,
+        .to() the local device (the P2P copy), then scatter locally."""
         local_dev = f"cuda:{self.gpu_id}"
-        peer_dev = f"cuda:{self.peer_k_buffer[0].device.index}"
-        src = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
-        dst = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
-        for layer in range(len(self.k_buffer)):
-            # gather rows on the peer (D) device, P2P-copy to local (P), then scatter.
-            # Cross-device indexed assignment is unsupported, so .to() the gather first.
-            self.k_buffer[layer][dst] = self.peer_k_buffer[layer][src].to(local_dev)
-            self.v_buffer[layer][dst] = self.peer_v_buffer[layer][src].to(local_dev)
+        peer_dev = f"cuda:{src_k[0].device.index}"
+        s = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
+        d = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
+        for layer in range(len(src_k)):
+            dst_k[layer][d] = src_k[layer][s].to(local_dev)
+            dst_v[layer][d] = src_v[layer][s].to(local_dev)
         torch.cuda.synchronize(self.gpu_id)
 
+    def _gather_copy_from_peer(self, src_indices, dst_indices) -> None:
+        """Real park copy (slice 3): peer KV pool slots -> local KV pool slots."""
+        self._p2p_gather(
+            self.peer_k_buffer, self.peer_v_buffer,
+            self.k_buffer, self.v_buffer,
+            src_indices, dst_indices,
+        )
+
     def _run_2b_selftest(self, payload) -> None:
-        """P: gather-copy the decode's test slots into local test slots and verify."""
+        """P: gather-copy the decode's dedicated test buffers into local test buffers
+        and verify the checksum (race-free validation of the copy primitive)."""
         st_indices = payload.get("selftest_indices")
         want = payload.get("selftest_checksum")
-        if not st_indices or want is None:
+        if not st_indices or want is None or "st_k_handles" not in payload:
             logger.warning("Idle KV parking [prefill]: no selftest payload; skip 2b check.")
             return
+        peer_st_k = [_open_ipc(h) for h in payload["st_k_handles"]]
+        peer_st_v = [_open_ipc(h) for h in payload["st_v_handles"]]
+        dev = f"cuda:{self.gpu_id}"
+        local_st_k = [torch.zeros(t.shape, dtype=t.dtype, device=dev) for t in peer_st_k]
+        local_st_v = [torch.zeros(t.shape, dtype=t.dtype, device=dev) for t in peer_st_v]
+
         t0 = time.perf_counter()
-        # dst = same indices in P's own pool (free at startup, overwritten on real use).
-        self._gather_copy_from_peer(st_indices, st_indices)
+        self._p2p_gather(peer_st_k, peer_st_v, local_st_k, local_st_v, st_indices, st_indices)
         ms = (time.perf_counter() - t0) * 1000.0
-        idx = torch.tensor(st_indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
+
+        idx = torch.tensor(st_indices, dtype=torch.long, device=dev)
         got = 0.0
-        for layer in range(len(self.k_buffer)):
-            got += float(self.k_buffer[layer][idx].float().sum().item())
-            got += float(self.v_buffer[layer][idx].float().sum().item())
+        for layer in range(len(local_st_k)):
+            got += float(local_st_k[layer][idx].float().sum().item())
+            got += float(local_st_v[layer][idx].float().sum().item())
         ok = abs(got - want) <= max(1.0, abs(want) * 1e-3)  # relative tol for fp32 sums
         nbytes = (
             len(st_indices)
-            * self.k_buffer[0][0].numel()
-            * self.k_buffer[0].element_size()
+            * peer_st_k[0][0].numel()
+            * peer_st_k[0].element_size()
             * 2
-            * len(self.k_buffer)
+            * len(peer_st_k)
         )
         logger.info(
             "Idle KV parking [prefill] 2b selftest: gather-copy %d slots x %d layers "
             "(k+v) %s (got=%.1f want=%.1f) in %.2fms (%.1f MB, ~%.1f GB/s). %s",
             len(st_indices),
-            len(self.k_buffer),
+            len(local_st_k),
             "MATCH" if ok else "MISMATCH",
             got,
             want,
