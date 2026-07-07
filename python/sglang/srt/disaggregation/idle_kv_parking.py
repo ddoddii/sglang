@@ -530,6 +530,16 @@ class IdleKVParkManager:
         n = len(src_indices)
         if n == 0 or n != len(token_ids):
             return
+
+        # slice 3d: only park what P is missing. P already caches the prompt prefix it
+        # prefilled itself; parking's real contribution is the tokens P lacks (the
+        # decode-generated tail, or the whole prefix once P has evicted it under
+        # pressure). Copy only [existing:n] -> huge saving vs copying the full prefix.
+        key = RadixKey(list(token_ids), extra_key=None)
+        existing = len(self.tree_cache.match_prefix(key).device_indices)
+        if existing >= n:
+            return  # P already has the whole prefix; nothing to park.
+
         dst = self.token_to_kv_pool_allocator.alloc(n)
         if dst is None:
             logger.debug("Idle KV parking [prefill]: no space to park rid=%s (%d tok)",
@@ -540,13 +550,11 @@ class IdleKVParkManager:
         inserted_into_tree = False
         try:
             t0 = time.perf_counter()
-            self._gather_copy_from_peer(src_indices, dst_list)
+            # Copy only the missing tail; dst[:existing] stays uninitialized but is
+            # freed below (insert matches that prefix and never reads those values).
+            self._gather_copy_from_peer(src_indices[existing:n], dst_list[existing:n])
             ms = (time.perf_counter() - t0) * 1000.0
 
-            # slice 3c: insert the copied prefix into P's radix so the next turn
-            # (routed to this P) prefix-hits instead of recomputing. insert() returns
-            # the length already present; those copied slots are redundant -> free.
-            key = RadixKey(list(token_ids), extra_key=None)
             new_prefix_len = self.tree_cache.insert(key, dst.to(torch.int64))
             inserted_into_tree = True  # tree now owns dst[new_prefix_len:]
             if new_prefix_len > 0:
@@ -562,11 +570,11 @@ class IdleKVParkManager:
         if self._parked_count <= 5 or self._parked_count % 50 == 0:
             logger.info(
                 "Idle KV parking [prefill]: parked+inserted rid=%s, %d tok "
-                "(%d already cached, +%d new) x %d layers in %.1fms. "
+                "(P had %d, copied+inserted %d new) x %d layers in %.1fms. "
                 "total parked=%d, tokens inserted=%d.",
                 msg.get("rid"),
                 n,
-                new_prefix_len,
+                existing,
                 inserted,
                 len(self.k_buffer),
                 ms,
