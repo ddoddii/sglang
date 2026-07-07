@@ -412,6 +412,11 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
+                # Idle KV parking: send this finished request's prefix KV to the idle
+                # prefill node (before release frees the slots). See idle_kv_parking.py.
+                if self.idle_kv_park_manager is not None:
+                    self.idle_kv_park_manager.park(req)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):

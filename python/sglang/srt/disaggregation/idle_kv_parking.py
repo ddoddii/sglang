@@ -25,6 +25,7 @@ otherwise _new_shared_cuda cannot open a handle for an invisible device.
 import logging
 import os
 import pickle
+import queue
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -146,6 +147,10 @@ class IdleKVParkManager:
         self._zmq_ctx = None
         self._pull = None  # prefill: receives park messages
         self._push = None  # decode: sends park messages
+        # prefill: park messages queued by the recv thread, drained on the main
+        # scheduler thread by poll_incoming() (the allocator is not thread-safe).
+        self._incoming: "queue.Queue[dict]" = queue.Queue()
+        self._parked_count = 0
 
         # Run setup off the hot path so server startup is not blocked.
         threading.Thread(
@@ -426,9 +431,8 @@ class IdleKVParkManager:
                 msg.get("gpu_id"),
             )
         elif mtype == "park":
-            # slice 3b: copy the prefix KV; slice 3c: radix insert. Placeholder.
-            logger.debug("Idle KV parking [prefill]: park msg (not yet handled): %s",
-                         {k: v for k, v in msg.items() if k != "kv_indices"})
+            # Enqueue; the copy/insert runs on the scheduler main thread (poll_incoming).
+            self._incoming.put(msg)
         else:
             logger.warning("Idle KV parking [prefill]: unknown msg type %r", mtype)
 
@@ -461,10 +465,88 @@ class IdleKVParkManager:
             addr,
         )
 
-    # --- decode side (slice 3b): park a finished/idle request ------------------
+    # --- decode side (slice 3b): park a finished request -----------------------
     def park(self, req: "Req") -> bool:
-        return False
+        """D: send the finished request's prefix (token ids + KV slot indices) to P.
 
-    # --- prefill side (slice 3c): receive parked KV + radix insert -------------
-    def poll_incoming(self) -> None:
-        return None
+        Called at request completion, before release_kv_cache frees the slots. The
+        KV is still valid at send time; P copies it when it drains the message.
+        NOTE (slice 3c): correctness under reuse needs an ack so D holds the slots
+        until P has copied; for now the tool-call idle gap keeps them valid at low load.
+        """
+        if self.role != "decode" or self._push is None:
+            return False
+        if getattr(req, "req_pool_idx", -1) == -1:
+            return False
+        try:
+            token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+            token_ids = list(req.origin_input_ids) + list(req.output_ids)
+            n = (len(token_ids) // self.page_size) * self.page_size
+            if n == 0 or token_indices.numel() < n:
+                return False
+            kv_indices = token_indices[:n].detach().to("cpu", torch.int64).tolist()
+            self._push.send(
+                pickle.dumps(
+                    {
+                        "type": "park",
+                        "rid": req.rid,
+                        "token_ids": token_ids[:n],
+                        "kv_indices": kv_indices,
+                    }
+                )
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error("Idle KV parking [decode]: park failed rid=%s: %r",
+                         getattr(req, "rid", "?"), e)
+            return False
+
+    # --- prefill side (slice 3b/3c): drain parked messages on the main thread --
+    def poll_incoming(self, max_msgs: int = 4) -> None:
+        """P: drain up to max_msgs parked prefixes, copy their KV from D over NVLink.
+
+        Runs on the scheduler main thread (allocator is not thread-safe). Slice 3b
+        copies + frees (validation); slice 3c will radix-insert instead of free.
+        """
+        if self.role != "prefill" or self.peer_k_buffer is None:
+            return
+        for _ in range(max_msgs):
+            try:
+                msg = self._incoming.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._receive_park(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill]: receive park failed: %r", e)
+
+    def _receive_park(self, msg: dict) -> None:
+        src_indices = msg["kv_indices"]
+        n = len(src_indices)
+        if n == 0:
+            return
+        dst = self.token_to_kv_pool_allocator.alloc(n)
+        if dst is None:
+            logger.debug("Idle KV parking [prefill]: no space to park rid=%s (%d tok)",
+                         msg.get("rid"), n)
+            return
+        dst_list = dst.detach().to("cpu", torch.int64).tolist()
+        t0 = time.perf_counter()
+        self._gather_copy_from_peer(src_indices, dst_list)
+        ms = (time.perf_counter() - t0) * 1000.0
+        # sanity: copied data should be non-zero real KV.
+        chk = float(self.k_buffer[0][dst[0]].float().abs().sum().item())
+        self._parked_count += 1
+        # slice 3b: no radix insert yet -> free to avoid leaking P's KV pool.
+        self.token_to_kv_pool_allocator.free(dst)
+        if self._parked_count <= 5 or self._parked_count % 50 == 0:
+            logger.info(
+                "Idle KV parking [prefill]: parked rid=%s, copied %d tokens x %d layers "
+                "D->P in %.1fms (k0[0] abs-sum=%.1f). total parked=%d. (3b: not inserted)",
+                msg.get("rid"),
+                n,
+                len(self.k_buffer),
+                ms,
+                chk,
+                self._parked_count,
+            )

@@ -357,6 +357,10 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.process_disagg_prefill_inflight_queue()
 
+            # Idle KV parking: drain any prefixes parked by decode nodes.
+            if self.idle_kv_park_manager is not None:
+                self.idle_kv_park_manager.poll_incoming()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -396,6 +400,10 @@ class SchedulerDisaggregationPrefillMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
+
+            # Idle KV parking: drain any prefixes parked by decode nodes.
+            if self.idle_kv_park_manager is not None:
+                self.idle_kv_park_manager.poll_incoming()
 
             # Update last_batch
             self.last_batch = batch
