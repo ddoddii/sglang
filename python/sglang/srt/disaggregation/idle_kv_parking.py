@@ -153,6 +153,15 @@ class IdleKVParkManager:
         self._incoming: "queue.Queue[dict]" = queue.Queue()
         self._parked_count = 0
         self._parked_tokens = 0
+        # diagnostics (why parking helps or not): skip vs copy, how much P already had,
+        # and whether parked prefixes survive in the radix until they could be hit.
+        self._skipped_count = 0
+        self._copied_count = 0
+        self._existing_sum = 0
+        self._n_sum = 0
+        from collections import deque as _deque
+
+        self._recent_parked = _deque(maxlen=16)  # (token_ids, n) samples for survival probe
 
         # Run setup off the hot path so server startup is not blocked.
         threading.Thread(
@@ -538,7 +547,9 @@ class IdleKVParkManager:
         key = RadixKey(list(token_ids), extra_key=None)
         existing = len(self.tree_cache.match_prefix(key).device_indices)
         if existing >= n:
-            return  # P already has the whole prefix; nothing to park.
+            self._skipped_count += 1  # P already had the whole prefix (no eviction)
+            self._maybe_diag()
+            return  # nothing to park.
 
         dst = self.token_to_kv_pool_allocator.alloc(n)
         if dst is None:
@@ -567,6 +578,11 @@ class IdleKVParkManager:
 
         self._parked_count += 1
         self._parked_tokens += inserted
+        self._copied_count += 1
+        self._existing_sum += existing
+        self._n_sum += n
+        if self._copied_count % 8 == 0:
+            self._recent_parked.append((list(token_ids), n))
         if self._parked_count <= 5 or self._parked_count % 50 == 0:
             logger.info(
                 "Idle KV parking [prefill]: parked+inserted rid=%s, %d tok "
@@ -581,3 +597,42 @@ class IdleKVParkManager:
                 self._parked_count,
                 self._parked_tokens,
             )
+        self._maybe_diag()
+
+    def _maybe_diag(self, every: int = 50) -> None:
+        """Periodic diagnostic to explain whether parking can help.
+
+        Distinguishes: H1 P retains prefix (high skip / high existing-fraction);
+        H2 parked entries evicted before hit (low survival); H3 parked but never
+        matched (high survival yet no reuse gain).
+        """
+        total = self._skipped_count + self._copied_count
+        if total == 0 or total % every != 0:
+            return
+        skip_rate = self._skipped_count / total
+        existing_frac = (self._existing_sum / self._n_sum) if self._n_sum else 0.0
+        # survival: are recently parked prefixes still (fully) present in the radix?
+        survived = 0
+        checked = 0
+        for tids, n0 in list(self._recent_parked):
+            try:
+                now = len(self.tree_cache.match_prefix(RadixKey(tids, extra_key=None)).device_indices)
+            except Exception:  # noqa: BLE001
+                continue
+            checked += 1
+            if now >= n0:
+                survived += 1
+        surv_rate = (survived / checked) if checked else -1.0
+        logger.info(
+            "Idle KV parking [prefill] DIAG: total=%d skip=%d(%.0f%%) copy=%d | "
+            "avg P-already-had=%.2f of prefix | parked-survival=%.0f%% (%d/%d recent) | "
+            "H1(retain)~skip↑&had↑ H2(evict)~survival↓ H3(no-match)~survival↑&reuse flat",
+            total,
+            self._skipped_count,
+            skip_rate * 100,
+            self._copied_count,
+            existing_frac,
+            surv_rate * 100 if surv_rate >= 0 else -1,
+            survived,
+            checked,
+        )
