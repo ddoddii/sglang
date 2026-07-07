@@ -30,11 +30,13 @@ import time
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import zmq
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -45,6 +47,8 @@ logger = logging.getLogger(__name__)
 PARK_DIR = os.environ.get("SGLANG_KV_PARK_DIR", "/dev/shm/sglang_kv_parking")
 # Decode publishes its KV-pool IPC handles here; prefill consumes them.
 DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
+# Prefill publishes its ZMQ park-control PULL address here; decode connects a PUSH.
+PREFILL_ZMQ_FILE = os.path.join(PARK_DIR, "prefill_park_zmq.pkl")
 RENDEZVOUS_TIMEOUT_S = 180
 
 # slice 2b self-test: number of KV slots to round-trip D->P to validate the
@@ -138,20 +142,26 @@ class IdleKVParkManager:
             )
             return
 
-        # Run IPC setup off the hot path so server startup is not blocked.
+        # ZMQ park control channel state (slice 3a).
+        self._zmq_ctx = None
+        self._pull = None  # prefill: receives park messages
+        self._push = None  # decode: sends park messages
+
+        # Run setup off the hot path so server startup is not blocked.
         threading.Thread(
-            target=self._setup_2a, name="idle-kv-park-2a", daemon=True
+            target=self._setup, name="idle-kv-park-setup", daemon=True
         ).start()
 
-    # --- slice 2a: IPC handle exchange + verification --------------------------
-    def _setup_2a(self) -> None:
+    def _setup(self) -> None:
         try:
             if self.role == "decode":
-                self._decode_publish_ipc()
+                self._decode_publish_ipc()   # 2a: publish KV-pool IPC handles
+                self._decode_connect_zmq()   # 3a: connect to prefill's park channel
             else:
-                self._prefill_consume_ipc()
+                self._prefill_setup_zmq()    # 3a: bind park channel + start receiver
+                self._prefill_consume_ipc()  # 2a/2b: open D's IPC, verify
         except Exception as e:  # noqa: BLE001
-            logger.error("Idle KV parking 2a setup failed (role=%s): %r", self.role, e)
+            logger.error("Idle KV parking setup failed (role=%s): %r", self.role, e)
 
     def _decode_publish_ipc(self) -> None:
         """D: export KV-pool buffer handles + a verification tensor to the rendezvous."""
@@ -373,10 +383,88 @@ class IdleKVParkManager:
             logger.warning("Idle KV parking [prefill]: KV read bench failed: %r", e)
             return -1.0
 
-    # --- decode side (slice 3): park a finished/idle request -------------------
+    # --- slice 3a: ZMQ park control channel (D pushes park messages to P) -------
+    def _prefill_setup_zmq(self) -> None:
+        """P: bind a PULL socket, publish its address, and start the receiver loop."""
+        self._zmq_ctx = zmq.Context(1)
+        port, self._pull = get_zmq_socket(self._zmq_ctx, zmq.PULL, endpoint=None)
+        addr = f"tcp://127.0.0.1:{port}"
+        tmp = PREFILL_ZMQ_FILE + f".tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            pickle.dump({"addr": addr, "gpu_id": self.gpu_id, "ts": time.time()}, f)
+        os.replace(tmp, PREFILL_ZMQ_FILE)
+        threading.Thread(
+            target=self._prefill_recv_loop, name="idle-kv-park-recv", daemon=True
+        ).start()
+        logger.info(
+            "Idle KV parking [prefill]: park control channel PULL bound at %s "
+            "(published to %s)",
+            addr,
+            PREFILL_ZMQ_FILE,
+        )
+
+    def _prefill_recv_loop(self) -> None:
+        while True:
+            try:
+                msg = pickle.loads(self._pull.recv())
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill]: recv failed: %r", e)
+                return
+            try:
+                self._handle_park_message(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill]: handle msg failed: %r", e)
+
+    def _handle_park_message(self, msg: dict) -> None:
+        mtype = msg.get("type")
+        if mtype == "ping":
+            logger.info(
+                "Idle KV parking [prefill]: park control channel OK — received %s "
+                "from %s (gpu%s). Ready for slice 3b park messages.",
+                mtype,
+                msg.get("from"),
+                msg.get("gpu_id"),
+            )
+        elif mtype == "park":
+            # slice 3b: copy the prefix KV; slice 3c: radix insert. Placeholder.
+            logger.debug("Idle KV parking [prefill]: park msg (not yet handled): %s",
+                         {k: v for k, v in msg.items() if k != "kv_indices"})
+        else:
+            logger.warning("Idle KV parking [prefill]: unknown msg type %r", mtype)
+
+    def _decode_connect_zmq(self) -> None:
+        """D: read prefill's PULL address, connect a PUSH, and send a test ping."""
+        deadline = time.time() + RENDEZVOUS_TIMEOUT_S
+        while not os.path.exists(PREFILL_ZMQ_FILE):
+            if time.time() > deadline:
+                logger.warning(
+                    "Idle KV parking [decode]: no prefill ZMQ file at %s after %ds; "
+                    "park control channel inactive.",
+                    PREFILL_ZMQ_FILE,
+                    RENDEZVOUS_TIMEOUT_S,
+                )
+                return
+            time.sleep(1.0)
+        with open(PREFILL_ZMQ_FILE, "rb") as f:
+            info = pickle.load(f)
+        addr = info["addr"]
+        self._zmq_ctx = zmq.Context(1)
+        self._push = get_zmq_socket(self._zmq_ctx, zmq.PUSH, endpoint=addr, bind=False)
+        self._push.send(
+            pickle.dumps(
+                {"type": "ping", "from": "decode", "gpu_id": self.gpu_id, "ts": time.time()}
+            )
+        )
+        logger.info(
+            "Idle KV parking [decode]: park control channel PUSH connected to %s, "
+            "sent ping.",
+            addr,
+        )
+
+    # --- decode side (slice 3b): park a finished/idle request ------------------
     def park(self, req: "Req") -> bool:
         return False
 
-    # --- prefill side (slice 4): receive parked KV + radix insert --------------
+    # --- prefill side (slice 3c): receive parked KV + radix insert -------------
     def poll_incoming(self) -> None:
         return None
