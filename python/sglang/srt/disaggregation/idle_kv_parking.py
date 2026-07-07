@@ -36,6 +36,7 @@ import zmq
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_zmq_socket
 
@@ -151,6 +152,7 @@ class IdleKVParkManager:
         # scheduler thread by poll_incoming() (the allocator is not thread-safe).
         self._incoming: "queue.Queue[dict]" = queue.Queue()
         self._parked_count = 0
+        self._parked_tokens = 0
 
         # Run setup off the hot path so server startup is not blocked.
         threading.Thread(
@@ -522,8 +524,9 @@ class IdleKVParkManager:
 
     def _receive_park(self, msg: dict) -> None:
         src_indices = msg["kv_indices"]
+        token_ids = msg["token_ids"]
         n = len(src_indices)
-        if n == 0:
+        if n == 0 or n != len(token_ids):
             return
         dst = self.token_to_kv_pool_allocator.alloc(n)
         if dst is None:
@@ -534,19 +537,33 @@ class IdleKVParkManager:
         t0 = time.perf_counter()
         self._gather_copy_from_peer(src_indices, dst_list)
         ms = (time.perf_counter() - t0) * 1000.0
-        # sanity: copied data should be non-zero real KV.
-        chk = float(self.k_buffer[0][dst[0]].float().abs().sum().item())
+
+        # slice 3c: insert the copied prefix into P's radix so the next turn
+        # (routed to this P) prefix-hits instead of recomputing. insert() returns the
+        # length already present in the tree; those copied slots are redundant -> free.
+        try:
+            key = RadixKey(list(token_ids), extra_key=None)
+            new_prefix_len = self.tree_cache.insert(key, dst.to(torch.int64))
+        except Exception:
+            self.token_to_kv_pool_allocator.free(dst)  # rollback on failure
+            raise
+        if new_prefix_len > 0:
+            self.token_to_kv_pool_allocator.free(dst[:new_prefix_len])
+        inserted = n - new_prefix_len
+
         self._parked_count += 1
-        # slice 3b: no radix insert yet -> free to avoid leaking P's KV pool.
-        self.token_to_kv_pool_allocator.free(dst)
+        self._parked_tokens += inserted
         if self._parked_count <= 5 or self._parked_count % 50 == 0:
             logger.info(
-                "Idle KV parking [prefill]: parked rid=%s, copied %d tokens x %d layers "
-                "D->P in %.1fms (k0[0] abs-sum=%.1f). total parked=%d. (3b: not inserted)",
+                "Idle KV parking [prefill]: parked+inserted rid=%s, %d tok "
+                "(%d already cached, +%d new) x %d layers in %.1fms. "
+                "total parked=%d, tokens inserted=%d.",
                 msg.get("rid"),
                 n,
+                new_prefix_len,
+                inserted,
                 len(self.k_buffer),
                 ms,
-                chk,
                 self._parked_count,
+                self._parked_tokens,
             )
