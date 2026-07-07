@@ -77,7 +77,9 @@ Phase 0 실측(→ `idle_kv_parking_phase0.md` §5)에서 **로컬 host DRAM L2*
 |---|---|---|
 | **Park 대상 계층** | **Design A: P GPU radix** (초과 시 CPU DRAM 강등) | 다음 턴 prefix hit로 재-prefill 스킵 → TTFT 이득 최대화 |
 | **라우팅 affinity** | **기존 router cache-aware routing에 의존** | sgl-router의 prefix cache-aware routing이 같은 P로 보내길 기대. sglang python만 수정, router 무변경. 가장 빠른 실험 착수 |
-| **전송 백엔드** | **NIXL** | agent 대칭 구조라 역방향(D→P) 구현이 Mooncake보다 자연스러움 |
+| **전송 백엔드** | **CUDA IPC + P2P (직접)** ~~NIXL~~ | server17에서 Mooncake는 "No RDMA→TCP fallback"이라 NVLink를 못 쓴다. NIXL도 GPU transport 보장 안 됨. NVLink 이득을 실제로 얻으려면 D↔P GPU 메모리를 CUDA IPC로 공유해 `cudaMemcpyPeer`(P2P)로 직접 옮겨야 한다. |
+
+> **전송 de-risk 실측 (server17)**: cross-process CUDA IPC + P2P 마이크로벤치(`experiments/benchmark/nvlink_cross_process_p2p_microbench.py`)에서 별개 프로세스 D(GPU1)→P(GPU0) 전송이 **52.2–52.8 GB/s**(단일 프로세스와 동일, IPC 오버헤드 0), `correct=True`. IPC 핸들 교환은 ~150ms 1회성(연결 셋업 시)이라 파킹마다 드는 비용이 아니다. → 슬라이스 2는 CUDA IPC 채널로 구현.
 
 ---
 
@@ -109,10 +111,12 @@ Turn N+1:
   - **P-side**: `receive_and_insert()` — 도착한 KV를 `HiRadixCache`에 insert + lock, 용량 초과 시 host pool 강등.
 - 유휴 판정 및 용량 상한(park가 활성 prefill을 밀어내지 않도록) 로직 포함.
 
-### 5.2 NIXL 역방향 채널: `disaggregation/nixl/conn.py`
+### 5.2 CUDA IPC 역방향 채널 (D→P GPU, NVLink)
 
-- `ParkSender`(D) / `ParkReceiver`(P) 추가. 기존 `NixlKVManager.send_kvcache` + staging room 인프라 재사용.
-- **prefix-hash 기반 park bootstrap room** 신설 (현재는 per-request `bootstrap_room`만 존재). park 세션의 lifecycle/bootstrap 설계 필요.
+- **연결 셋업(1회)**: D가 자신의 `token_to_kv_pool` GPU 버퍼의 CUDA IPC 핸들을 P에 전달(제어 채널: 기존 bootstrap/ZMQ 재사용). P가 `cudaIpcOpenMemHandle`로 D의 KV 풀을 자기 주소공간에 매핑.
+- **park(유휴 시)**: P가 consumer로서 D의 해당 prefix 페이지들을 자기 KV 풀 페이지로 `copy_`(P2P/NVLink) → HiRadixCache insert. (마이크로벤치의 consumer-pull 패턴과 동형.)
+- 페이지 gather: prefix KV는 paged라 페이지 인덱스 목록으로 gather 복사. 기존 decode offload manager의 device→host 페이지 복사 경로를 mirror하되 target을 host가 아닌 **peer GPU(IPC 매핑)**로.
+- prefix-hash로 park 항목 식별. 핸들 lifecycle/정리(연결 종료 시 `cudaIpcCloseMemHandle`) 설계.
 - 참고: `base/conn.py`, `common/conn.py`의 `BaseKVSender`/`BaseKVReceiver` 계약과 정합.
 
 ### 5.3 Scheduler 배선: `managers/scheduler.py` (~L475)
@@ -152,7 +156,7 @@ Turn N+1:
 
 ### Phase 1 — D→P GPU parking 뼈대 (핵심)
 1. `idle_kv_parking.py` 스켈레톤 (`IdleKVParkManager`).
-2. NIXL 역방향 채널 (`ParkSender`/`ParkReceiver`, park room bootstrap).
+2. CUDA IPC 역방향 채널 (D KV풀 핸들 공유 → P가 peer-copy). de-risk 완료.
 3. Scheduler 배선 (`large-class-init-style` 준수).
 4. Decode 트리거 (free 직전 park enqueue).
 5. Prefill 수신·insert (`HiRadixCache`).
