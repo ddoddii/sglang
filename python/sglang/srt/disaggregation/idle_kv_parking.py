@@ -510,7 +510,9 @@ class IdleKVParkManager:
         Runs on the scheduler main thread (allocator is not thread-safe). Slice 3b
         copies + frees (validation); slice 3c will radix-insert instead of free.
         """
-        if self.role != "prefill" or self.peer_k_buffer is None:
+        # Gate on peer_ready so both peer_k_buffer and peer_v_buffer are fully mapped
+        # and verified before we touch them.
+        if self.role != "prefill" or not self.peer_ready.is_set():
             return
         for _ in range(max_msgs):
             try:
@@ -534,21 +536,25 @@ class IdleKVParkManager:
                          msg.get("rid"), n)
             return
         dst_list = dst.detach().to("cpu", torch.int64).tolist()
-        t0 = time.perf_counter()
-        self._gather_copy_from_peer(src_indices, dst_list)
-        ms = (time.perf_counter() - t0) * 1000.0
-
-        # slice 3c: insert the copied prefix into P's radix so the next turn
-        # (routed to this P) prefix-hits instead of recomputing. insert() returns the
-        # length already present in the tree; those copied slots are redundant -> free.
+        # From here dst is allocated: any failure must free it, or the KV pool leaks.
+        inserted_into_tree = False
         try:
+            t0 = time.perf_counter()
+            self._gather_copy_from_peer(src_indices, dst_list)
+            ms = (time.perf_counter() - t0) * 1000.0
+
+            # slice 3c: insert the copied prefix into P's radix so the next turn
+            # (routed to this P) prefix-hits instead of recomputing. insert() returns
+            # the length already present; those copied slots are redundant -> free.
             key = RadixKey(list(token_ids), extra_key=None)
             new_prefix_len = self.tree_cache.insert(key, dst.to(torch.int64))
+            inserted_into_tree = True  # tree now owns dst[new_prefix_len:]
+            if new_prefix_len > 0:
+                self.token_to_kv_pool_allocator.free(dst[:new_prefix_len])
         except Exception:
-            self.token_to_kv_pool_allocator.free(dst)  # rollback on failure
+            if not inserted_into_tree:
+                self.token_to_kv_pool_allocator.free(dst)  # rollback whole alloc
             raise
-        if new_prefix_len > 0:
-            self.token_to_kv_pool_allocator.free(dst[:new_prefix_len])
         inserted = n - new_prefix_len
 
         self._parked_count += 1
