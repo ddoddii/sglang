@@ -79,7 +79,7 @@ Phase 0 실측(→ `idle_kv_parking_phase0.md` §5)에서 **로컬 host DRAM L2*
 | **라우팅 affinity** | **기존 router cache-aware routing에 의존** | sgl-router의 prefix cache-aware routing이 같은 P로 보내길 기대. sglang python만 수정, router 무변경. 가장 빠른 실험 착수 |
 | **전송 백엔드** | **CUDA IPC + P2P (직접)** ~~NIXL~~ | server17에서 Mooncake는 "No RDMA→TCP fallback"이라 NVLink를 못 쓴다. NIXL도 GPU transport 보장 안 됨. NVLink 이득을 실제로 얻으려면 D↔P GPU 메모리를 CUDA IPC로 공유해 `cudaMemcpyPeer`(P2P)로 직접 옮겨야 한다. |
 
-> **전송 de-risk 실측 (server17)**: cross-process CUDA IPC + P2P 마이크로벤치(`experiments/benchmark/nvlink_cross_process_p2p_microbench.py`)에서 별개 프로세스 D(GPU1)→P(GPU0) 전송이 **52.2–52.8 GB/s**(단일 프로세스와 동일, IPC 오버헤드 0), `correct=True`. IPC 핸들 교환은 ~150ms 1회성(연결 셋업 시)이라 파킹마다 드는 비용이 아니다. → 슬라이스 2는 CUDA IPC 채널로 구현.
+> **전송 de-risk 실측 (server17)**: **[2a 완료]** 실제 sglang 프로세스에서도 검증: decode가 KV풀 32k+32v IPC 핸들 publish, prefill이 open+P2P read하여 checksum MATCH, KV P2P read ~51.0 GB/s (`Idle KV parking [prefill]: ... verified -> ready for 2b`). sglang allocator에서 `_share_cuda_` 정상. cross-process CUDA IPC + P2P 마이크로벤치(`experiments/benchmark/nvlink_cross_process_p2p_microbench.py`)에서 별개 프로세스 D(GPU1)→P(GPU0) 전송이 **52.2–52.8 GB/s**(단일 프로세스와 동일, IPC 오버헤드 0), `correct=True`. IPC 핸들 교환은 ~150ms 1회성(연결 셋업 시)이라 파킹마다 드는 비용이 아니다. → 슬라이스 2는 CUDA IPC 채널로 구현.
 
 ---
 
