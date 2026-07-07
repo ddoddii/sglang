@@ -47,6 +47,11 @@ PARK_DIR = os.environ.get("SGLANG_KV_PARK_DIR", "/dev/shm/sglang_kv_parking")
 DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
 RENDEZVOUS_TIMEOUT_S = 180
 
+# slice 2b self-test: number of KV slots to round-trip D->P to validate the
+# multi-layer indexed gather-copy over NVLink. Uses free slots [1..N] at startup
+# (slot 0 is the padded dummy); the allocator overwrites them on real use.
+SELFTEST_N_SLOTS = 64
+
 
 def _export_ipc(tensor: torch.Tensor) -> dict:
     """Export a CUDA tensor as a picklable IPC descriptor (mirrors mm_utils.py)."""
@@ -156,6 +161,11 @@ class IdleKVParkManager:
         verify_checksum = float(verify.double().sum().item())
         torch.cuda.synchronize(self.gpu_id)
 
+        # slice 2b: write a known per-slot pattern into free test slots across all
+        # layers so the prefill side can validate the indexed gather-copy.
+        st_indices = list(range(1, 1 + SELFTEST_N_SLOTS))
+        st_checksum = self._write_selftest_pattern(st_indices)
+
         payload = {
             "role": "decode",
             "gpu_id": self.gpu_id,
@@ -168,6 +178,8 @@ class IdleKVParkManager:
             "verify_numel": verify.numel(),
             "k_handles": [_export_ipc(t) for t in self.k_buffer],
             "v_handles": [_export_ipc(t) for t in self.v_buffer],
+            "selftest_indices": st_indices,
+            "selftest_checksum": st_checksum,
             "ts": time.time(),
         }
         # Keep verify alive for the peer's lifetime.
@@ -179,11 +191,80 @@ class IdleKVParkManager:
         os.replace(tmp, DECODE_IPC_FILE)  # atomic publish
         logger.info(
             "Idle KV parking [decode]: published %d k + %d v IPC handles + verify "
-            "(checksum=%.1f) to %s",
+            "(checksum=%.1f) + selftest(%d slots, checksum=%.1f) to %s",
             len(self.k_buffer),
             len(self.v_buffer),
             verify_checksum,
+            len(st_indices),
+            st_checksum,
             DECODE_IPC_FILE,
+        )
+
+    def _write_selftest_pattern(self, indices) -> float:
+        """Write a distinct small value into each test slot across all k/v layers.
+
+        Returns the total checksum (sum over all layers/slots/elements of k and v).
+        Values are small ints, exact in fp16/bf16. Safe on free startup slots.
+        """
+        idx = torch.tensor(indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
+        vals = ((idx % 50) + 1).to(self.k_buffer[0].dtype)  # [N]
+        total = 0.0
+        for layer in range(len(self.k_buffer)):
+            for buf in (self.k_buffer[layer], self.v_buffer[layer]):
+                # buf[idx] shape: [N, head_num, head_dim]; broadcast per-slot value.
+                buf[idx] = vals.view(-1, *([1] * (buf.dim() - 1)))
+                total += float(buf[idx].float().sum().item())
+        torch.cuda.synchronize(self.gpu_id)
+        return total
+
+    def _gather_copy_from_peer(self, src_indices, dst_indices) -> None:
+        """Copy KV slots src_indices (peer/D pool) -> dst_indices (local pool),
+        across all layers, over NVLink P2P. Reusable by the real park path (slice 3)."""
+        src = torch.tensor(src_indices, dtype=torch.long, device=f"cuda:{self.peer_k_buffer[0].device.index}")
+        dst = torch.tensor(dst_indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
+        for layer in range(len(self.k_buffer)):
+            self.k_buffer[layer][dst] = self.peer_k_buffer[layer][src]
+            self.v_buffer[layer][dst] = self.peer_v_buffer[layer][src]
+        torch.cuda.synchronize(self.gpu_id)
+
+    def _run_2b_selftest(self, payload) -> None:
+        """P: gather-copy the decode's test slots into local test slots and verify."""
+        st_indices = payload.get("selftest_indices")
+        want = payload.get("selftest_checksum")
+        if not st_indices or want is None:
+            logger.warning("Idle KV parking [prefill]: no selftest payload; skip 2b check.")
+            return
+        t0 = time.perf_counter()
+        # dst = same indices in P's own pool (free at startup, overwritten on real use).
+        self._gather_copy_from_peer(st_indices, st_indices)
+        ms = (time.perf_counter() - t0) * 1000.0
+        idx = torch.tensor(st_indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
+        got = 0.0
+        for layer in range(len(self.k_buffer)):
+            got += float(self.k_buffer[layer][idx].float().sum().item())
+            got += float(self.v_buffer[layer][idx].float().sum().item())
+        ok = abs(got - want) <= max(1.0, abs(want) * 1e-3)  # relative tol for fp32 sums
+        nbytes = (
+            len(st_indices)
+            * self.k_buffer[0][0].numel()
+            * self.k_buffer[0].element_size()
+            * 2
+            * len(self.k_buffer)
+        )
+        logger.info(
+            "Idle KV parking [prefill] 2b selftest: gather-copy %d slots x %d layers "
+            "(k+v) %s (got=%.1f want=%.1f) in %.2fms (%.1f MB, ~%.1f GB/s). %s",
+            len(st_indices),
+            len(self.k_buffer),
+            "MATCH" if ok else "MISMATCH",
+            got,
+            want,
+            ms,
+            nbytes / 1e6,
+            (nbytes / (ms / 1000.0) / 1e9) if ms > 0 else -1.0,
+            "indexed gather-copy over NVLink verified -> ready for slice 3."
+            if ok
+            else "WARNING: gather-copy mismatch; investigate.",
         )
 
     def _prefill_consume_ipc(self) -> None:
@@ -239,6 +320,13 @@ class IdleKVParkManager:
             if (ok and can_p2p)
             else "WARNING: verification/p2p not clean; investigate.",
         )
+
+        # slice 2b: validate the real multi-layer indexed gather-copy from D's pool.
+        if ok and can_p2p:
+            try:
+                self._run_2b_selftest(payload)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill] 2b selftest failed: %r", e)
 
     def _bench_kv_read(self, iters: int = 20) -> float:
         """Copy one layer's k_buffer from the peer pool to a local buffer, timed."""
