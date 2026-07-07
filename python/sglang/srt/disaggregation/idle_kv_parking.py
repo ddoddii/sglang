@@ -220,11 +220,15 @@ class IdleKVParkManager:
     def _gather_copy_from_peer(self, src_indices, dst_indices) -> None:
         """Copy KV slots src_indices (peer/D pool) -> dst_indices (local pool),
         across all layers, over NVLink P2P. Reusable by the real park path (slice 3)."""
-        src = torch.tensor(src_indices, dtype=torch.long, device=f"cuda:{self.peer_k_buffer[0].device.index}")
-        dst = torch.tensor(dst_indices, dtype=torch.long, device=f"cuda:{self.gpu_id}")
+        local_dev = f"cuda:{self.gpu_id}"
+        peer_dev = f"cuda:{self.peer_k_buffer[0].device.index}"
+        src = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
+        dst = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
         for layer in range(len(self.k_buffer)):
-            self.k_buffer[layer][dst] = self.peer_k_buffer[layer][src]
-            self.v_buffer[layer][dst] = self.peer_v_buffer[layer][src]
+            # gather rows on the peer (D) device, P2P-copy to local (P), then scatter.
+            # Cross-device indexed assignment is unsupported, so .to() the gather first.
+            self.k_buffer[layer][dst] = self.peer_k_buffer[layer][src].to(local_dev)
+            self.v_buffer[layer][dst] = self.peer_v_buffer[layer][src].to(local_dev)
         torch.cuda.synchronize(self.gpu_id)
 
     def _run_2b_selftest(self, payload) -> None:
