@@ -263,13 +263,19 @@ Design A 실패 원인(P GPU 병목)을 우회하려 **전용 유휴 GPU(GPU2)�
 
 radix 대비 hicache는 reuse를 **2.9×**(26%→74%) 끌어올려 재계산 토큰을 1/3로 줄인다 → TTFT 2.40s→1.45s.
 
-### 예측 (park arm)
+### 측정 결과 (확정, 3-arm back-to-back, pool 40000, C=8, delay 3s, 200 items)
 
-park(4a)은 KV를 GPU2에 **저장만** 하고 prefill 경로가 그것을 읽는 **fetch-on-hit(4b)이 없다**. 따라서:
-- `park.reuse_ratio ≈ radix.reuse_ratio ≈ 0.26` (park은 prefix-hit을 만들지 못함)
-- `park.TTFT ≈ radix.TTFT` ≫ `hicache.TTFT`
+| arm | TTFT | throughput | reuse_ratio | cached tok | vs radix TTFT |
+|---|---|---|---|---|---|
+| radix | 1.767s | 64.2 tok/s | **0.399** | 1.42M | — |
+| **hicache** | **1.333s** | 66.7 tok/s | **0.744** | 2.64M | **−24.6%** |
+| park (4a) | 1.856s | 62.4 tok/s | **0.390** | 1.38M | **+5.0%** |
 
-즉 **저장 티어를 추가하는 것만으로는 이득이 없고**, 병목은 대역폭이 아니라 *fetch 통합*이다. 그리고 fetch(4b)를 붙여도 이 토폴로지에선 GPU2→GPU0가 PCIe(§9)라 host-DRAM hicache와 동률이 상한.
+**예측 그대로 확인됨:**
+- `park.reuse (0.390) ≈ radix.reuse (0.399)` ≠ `hicache (0.744)`. park은 KV를 GPU2에 **저장만** 하고 prefill이 읽는 **fetch-on-hit(4b)이 없어 prefix-hit을 만들지 못한다.** (분석기 진단이 자동으로 이를 표기.)
+- `park.TTFT (1.856s)`는 hicache(1.333s) 대비 **+39.2% 느리고**, radix보다도 **오히려 +5.0% 느리다** — D→GPU2 파킹 복사 오버헤드가 순손실이다(읽는 쪽이 없으므로).
+
+**결론**: 병목은 대역폭이 아니라 *fetch 통합*이다. 저장 티어를 추가하는 것만으로는 이득이 0이며, 통합된 fetch 경로를 가진 host-DRAM hicache가 명확히 이긴다(reuse 2.9×, TTFT −24.6%). fetch(4b)를 붙여도 이 토폴로지에선 GPU2→GPU0가 PCIe(§9)라 host-DRAM hicache 동률이 상한. → **park 아이디어는 이 2×A6000 하드웨어에서 실익 없음이 메커니즘(reuse 미개선)까지 규명됨.** Phase 1 종결.
 
 ### 실행 (turnkey)
 
