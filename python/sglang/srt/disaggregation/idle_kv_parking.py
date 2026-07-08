@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 # Same-node rendezvous directory (NVLink parking is intra-node). Overridable for tests.
 PARK_DIR = os.environ.get("SGLANG_KV_PARK_DIR", "/dev/shm/sglang_kv_parking")
+# Dedicated park pool GPU (slice 4). If set, prefill parks into a separate buffer on
+# this idle GPU instead of its own radix, so parked entries survive P-GPU pressure.
+# (Should move to environ.py for upstream; os.environ for research iteration.)
+_PARK_GPU_ENV = os.environ.get("SGLANG_KV_PARK_GPU")
+PARK_GPU = int(_PARK_GPU_ENV) if _PARK_GPU_ENV not in (None, "") else None
+PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "100000"))
 # Decode publishes its KV-pool IPC handles here; prefill consumes them.
 DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
 # Prefill publishes its ZMQ park-control PULL address here; decode connects a PUSH.
@@ -160,6 +166,15 @@ class IdleKVParkManager:
         self._existing_sum = 0
         self._n_sum = 0
         self._received_msgs = 0  # park messages enqueued by the recv thread
+
+        # slice 4: dedicated park pool on an idle GPU (survives P-GPU eviction).
+        self.park_gpu = PARK_GPU
+        self._park_k = None
+        self._park_v = None
+        self._park_index = None  # OrderedDict: hash(token_ids) -> (start_slot, n)
+        self._park_next = 0
+        if self.role == "prefill" and self.park_gpu is not None and self.k_buffer is not None:
+            self._init_park_gpu_pool()
         from collections import deque as _deque
 
         self._recent_parked = _deque(maxlen=16)  # (token_ids, n) samples for survival probe
@@ -535,11 +550,83 @@ class IdleKVParkManager:
             except Exception as e:  # noqa: BLE001
                 logger.error("Idle KV parking [prefill]: receive park failed: %r", e)
 
+    # --- slice 4: dedicated idle-GPU park pool -------------------------------
+    def _init_park_gpu_pool(self) -> None:
+        from collections import OrderedDict
+
+        dev = f"cuda:{self.park_gpu}"
+        head_num, head_dim = self.k_buffer[0].shape[1], self.k_buffer[0].shape[2]
+        dtype = self.k_buffer[0].dtype
+        L = len(self.k_buffer)
+        N = PARK_POOL_TOKENS
+        self._park_k = [torch.zeros(N, head_num, head_dim, dtype=dtype, device=dev) for _ in range(L)]
+        self._park_v = [torch.zeros(N, head_num, head_dim, dtype=dtype, device=dev) for _ in range(L)]
+        self._park_index = OrderedDict()  # hash -> (start, n)
+        self._park_next = 0
+        gb = 2 * N * head_num * head_dim * self.k_buffer[0].element_size() * L / 1e9
+        logger.info(
+            "Idle KV parking [prefill]: dedicated park pool on GPU%d = %d tokens x %d "
+            "layers (~%.1f GB). Parked entries survive P-GPU eviction.",
+            self.park_gpu, N, L, gb,
+        )
+
+    def _gather_copy_peer_to_park(self, src_indices, start: int, n: int) -> None:
+        """Copy peer(D) KV slots -> the park pool on the idle GPU, across all layers."""
+        park_dev = f"cuda:{self.park_gpu}"
+        peer_dev = f"cuda:{self.peer_k_buffer[0].device.index}"
+        s = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
+        for layer in range(len(self.peer_k_buffer)):
+            self._park_k[layer][start : start + n] = self.peer_k_buffer[layer][s].to(park_dev)
+            self._park_v[layer][start : start + n] = self.peer_v_buffer[layer][s].to(park_dev)
+        torch.cuda.synchronize(self.park_gpu)
+
+    def _park_to_gpu(self, token_ids, src_indices, n: int) -> None:
+        """Store the prefix KV in the dedicated idle-GPU pool (ring buffer + LRU index)."""
+        if n > PARK_POOL_TOKENS:
+            return
+        h = hash(tuple(token_ids))
+        if h in self._park_index:
+            self._park_index.move_to_end(h)
+            self._skipped_count += 1  # already parked
+            return
+        start = self._park_next
+        if start + n > PARK_POOL_TOKENS:
+            start = 0  # wrap
+        end = start + n
+        # Evict index entries whose slots the new write overlaps.
+        for k in list(self._park_index.keys()):
+            s0, ln = self._park_index[k]
+            if not (s0 + ln <= start or s0 >= end):
+                del self._park_index[k]
+        t0 = time.perf_counter()
+        self._gather_copy_peer_to_park(src_indices, start, n)
+        ms = (time.perf_counter() - t0) * 1000.0
+        self._park_index[h] = (start, n)
+        self._park_next = end % PARK_POOL_TOKENS
+        self._copied_count += 1
+        self._n_sum += n
+        if self._copied_count % 8 == 0:
+            self._recent_parked.append((h, n))
+        if self._parked_count <= 5 or self._copied_count % 50 == 0:
+            self._parked_count += 1
+            logger.info(
+                "Idle KV parking [prefill] GPU%d-park: rid=%s, %d tok x %d layers in "
+                "%.1fms. index=%d entries, next=%d.",
+                self.park_gpu, "?", n, len(self.peer_k_buffer), ms,
+                len(self._park_index), self._park_next,
+            )
+
     def _receive_park(self, msg: dict) -> None:
         src_indices = msg["kv_indices"]
         token_ids = msg["token_ids"]
         n = len(src_indices)
         if n == 0 or n != len(token_ids):
+            return
+
+        # slice 4: park into a dedicated idle-GPU pool that survives P-GPU pressure.
+        if self.park_gpu is not None:
+            self._park_to_gpu(token_ids, src_indices, n)
+            self._maybe_diag()
             return
 
         # slice 3d: only park what P is missing. P already caches the prompt prefix it
@@ -614,16 +701,23 @@ class IdleKVParkManager:
             return
         skip_rate = self._skipped_count / total
         existing_frac = (self._existing_sum / self._n_sum) if self._n_sum else 0.0
-        # survival: are recently parked prefixes still (fully) present in the radix?
+        # survival: are recently parked prefixes still present?
+        # park-GPU mode -> still in the park index; GPU-radix mode -> still match in radix.
         survived = 0
         checked = 0
-        for tids, n0 in list(self._recent_parked):
+        for item, n0 in list(self._recent_parked):
             try:
-                now = len(self.tree_cache.match_prefix(RadixKey(tids, extra_key=None)).device_indices)
+                if self.park_gpu is not None:
+                    present = item in self._park_index  # item is the hash
+                else:
+                    present = (
+                        len(self.tree_cache.match_prefix(RadixKey(item, extra_key=None)).device_indices)
+                        >= n0
+                    )
             except Exception:  # noqa: BLE001
                 continue
             checked += 1
-            if now >= n0:
+            if present:
                 survived += 1
         surv_rate = (survived / checked) if checked else -1.0
         logger.info(
