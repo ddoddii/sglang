@@ -345,10 +345,50 @@ evict로 자리 확보, (b) **async** prefetch. 본 구현은 (a) alloc 실패�
 작고(nospace가 막음) 동기 복사가 있어 **순 TTFT는 무승부**. 근본 한계는 **restore가 병목 P GPU를
 점유**해야 한다는 것.
 
-### 압박 완화 스윕 (pool sweep, 진행 중)
+### 압박 완화 스윕 결과 — catch-22 실증 (결정적)
 
-nospace 32%가 강압박(pool 40000) 탓이므로, P 풀을 키워 restore 자리를 주고 재측정한다
-(`run_head_to_head_pool_sweep.sh`, POOLS=60000/80000/120000). 상충: 풀↑ → nospace↓ 지만 radix도
-evict를 덜 해(reuse↑) hicache와 격차가 닫힘 → park이 되찾을 여지도 감소. **스윗스팟**(radix가
-아직 evict하지만 restore 자리가 있는 pool)에서 park이 radix를 이기는지 확인. `head_to_head_pool_
-compare.py`가 pool별 park-vs-radix-vs-hicache를 한 표로 출력.
+P 풀을 키워 restore 자리를 주고 재측정(`run_head_to_head_pool_sweep.sh`):
+
+| pool | radix TTFT / reuse | hicache TTFT / reuse | park TTFT / reuse | park vs radix |
+|---|---|---|---|---|
+| 40000 (강압박) | 1.83 / **0.39** | 1.38 / **0.74** | 1.83 / 0.45 | +0.2% |
+| 60000 | 1.27 / **0.74** | 1.38 / 0.74 | 1.19 / 0.74 | −6.3%* |
+| 80000 | 1.17 / **0.74** | 1.38 / 0.75 | 1.19 / 0.74 | +1.0% |
+| 120000 | 1.15 / **0.74** | 1.27 / 0.75 | 1.15 / 0.74 | +0.4% |
+
+\* pool-60000의 −6.3%는 park이 빨라서가 아니라 **radix-60000 TTFT가 outlier(1.27, 다른 pool보다 높음)**
+라 생긴 착시다. reuse가 radix(0.736)≈park(0.741)로 사실상 동일 → fetch가 유의미하게 안 걸림. 노이즈.
+
+**핵심 관찰 — 두 조건이 상호배타적(catch-22):**
+1. **회수할 가치가 있는 구간 = pool 40000(강압박)뿐.** 여기서만 radix가 evict해 reuse가
+   0.39로 떨어지고 hicache(0.74)와 격차가 벌어진다. 그런데 이 구간은 **nospace 32%** — restore가
+   P GPU에 자리를 못 잡는 바로 그 구간.
+2. **restore 자리가 있는 구간 = pool ≥60000.** 그런데 여기선 radix가 evict를 안 해 **reuse가
+   이미 0.74** = hicache와 동일 → **되찾을 게 없다.** 세 arm 모두 reuse 0.74로 수렴.
+3. → **"restore가 가치 있다"(evict 발생)와 "restore가 자리 있다"(P 여유)가 결코 공존하지 않는다.**
+   park reuse는 모든 pool에서 radix와 동일 → **어떤 operating point에서도 park이 radix를 유의미하게
+   이기지 못한다.**
+
+**부가 관찰**: pool ≥60000에서 **hicache가 radix보다 느리다**(TTFT +8~10%). evict가 없으니
+host-offload 계층은 순수 오버헤드. hicache의 우위는 오직 강압박(pool 40000)에서만 성립.
+
+### Phase 1 최종 결론 (idle KV parking, 2×A6000 단일 노드)
+
+fetch-on-hit(4b)까지 완비해 end-to-end로 검증한 결과, **park+fetch는 이 하드웨어의 어느
+operating point에서도 radix(recompute) 대비 순 이득이 없다.** 근본 원인은 구현 디테일이 아니라
+구조적 catch-22다:
+- 파킹의 가치 = P가 prefix를 evict할 때(압박) 재계산을 fetch로 대체하는 것.
+- 그러나 **fetch한 KV는 attention이 읽으려면 병목인 P GPU 풀에 다시 들어가야 한다**(nospace) —
+  transfer를 아무리 빨리(NVLink) 해도 이 제약은 **토폴로지 독립적**. 저장은 유휴 자원으로 offload
+  되지만 **restore는 병목을 점유**한다.
+- 압박을 풀어 자리를 주면 evict 자체가 사라져 회수 대상이 소멸.
+
+hicache가 강압박에서 이기는 이유는 같은 "P GPU로 restore" 제약을 **evict-to-room + async
+prefetch**로 관리하기 때문. park을 그 수준으로 엔지니어링하면(evict-to-fetch + async 복사)
+hicache를 **재현**할 수 있으나, 이 토폴로지선 GPU2→GPU0가 PCIe(=host DRAM와 동속)이고 용량도
+26GB<125GB라 **넘어설 수는 없다.**
+
+**아이디어가 실익을 내려면**: (1) attention이 remote KV를 직접 읽는 **disaggregated/remote
+attention**(restore가 P GPU를 점유하지 않아도 됨), 또는 (2) host DRAM이 유일 로컬 tier이고 원격
+GPU 합산 용량이 host를 압도하는 **진짜 multi-node**. 단일 노드 단일 GPU-tier로는 hicache가 이미
+상한. 파이프라인 코드(2a~4b: IPC/P2P/park/fetch)는 그런 환경의 재사용 자산으로 남긴다.
