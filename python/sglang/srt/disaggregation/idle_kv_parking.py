@@ -159,6 +159,7 @@ class IdleKVParkManager:
         self._copied_count = 0
         self._existing_sum = 0
         self._n_sum = 0
+        self._received_msgs = 0  # park messages enqueued by the recv thread
         from collections import deque as _deque
 
         self._recent_parked = _deque(maxlen=16)  # (token_ids, n) samples for survival probe
@@ -443,6 +444,7 @@ class IdleKVParkManager:
             )
         elif mtype == "park":
             # Enqueue; the copy/insert runs on the scheduler main thread (poll_incoming).
+            self._received_msgs += 1
             self._incoming.put(msg)
         else:
             logger.warning("Idle KV parking [prefill]: unknown msg type %r", mtype)
@@ -599,12 +601,13 @@ class IdleKVParkManager:
             )
         self._maybe_diag()
 
-    def _maybe_diag(self, every: int = 50) -> None:
+    def _maybe_diag(self, every: int = 10) -> None:
         """Periodic diagnostic to explain whether parking can help.
 
         Distinguishes: H1 P retains prefix (high skip / high existing-fraction);
         H2 parked entries evicted before hit (low survival); H3 parked but never
-        matched (high survival yet no reuse gain).
+        matched (high survival yet no reuse gain); plus backlog (recv >> processed
+        means the copy can't keep up with the park rate under load).
         """
         total = self._skipped_count + self._copied_count
         if total == 0 or total % every != 0:
@@ -624,10 +627,13 @@ class IdleKVParkManager:
                 survived += 1
         surv_rate = (survived / checked) if checked else -1.0
         logger.info(
-            "Idle KV parking [prefill] DIAG: total=%d skip=%d(%.0f%%) copy=%d | "
-            "avg P-already-had=%.2f of prefix | parked-survival=%.0f%% (%d/%d recent) | "
-            "H1(retain)~skip↑&had↑ H2(evict)~survival↓ H3(no-match)~survival↑&reuse flat",
+            "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
+            "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
+            "H1(retain):skip↑had↑  H2(evict):survival↓  H3(no-match):survival↑reuse-flat  "
+            "BACKLOG:recv≫processed=copy-too-slow",
+            self._received_msgs,
             total,
+            self._incoming.qsize(),
             self._skipped_count,
             skip_rate * 100,
             self._copied_count,
