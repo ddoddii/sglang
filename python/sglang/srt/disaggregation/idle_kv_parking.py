@@ -121,6 +121,12 @@ class IdleKVParkManager:
         self.server_args = server_args
         self.page_size = server_args.page_size
         self.gpu_id = server_args.base_gpu_id
+        # Rendezvous freshness: only accept a peer IPC file published AFTER this
+        # manager started. A stale decode_kvpool_ipc.pkl left in /dev/shm by a prior
+        # run points at a dead process's GPU memory -> opening its handles throws
+        # CUDA "invalid resource handle" and disables parking. Prefill launches before
+        # decode (start script), so a fresh decode publish always has ts >= this.
+        self._setup_start_ts = time.time()
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         self.k_buffer: Optional[List[torch.Tensor]] = getattr(self.kv_cache, "k_buffer", None)
@@ -353,19 +359,28 @@ class IdleKVParkManager:
         """P: open D's handles, verify NVLink P2P read, keep KV-pool mapping for 2b."""
         torch.cuda.set_device(self.gpu_id)
         deadline = time.time() + RENDEZVOUS_TIMEOUT_S
-        while not os.path.exists(DECODE_IPC_FILE):
+        # Wait for a FRESH decode IPC file (ts >= our start). Skip/stale files left by
+        # a prior run would open dead GPU handles (CUDA invalid resource handle).
+        payload = None
+        while True:
+            if os.path.exists(DECODE_IPC_FILE):
+                try:
+                    with open(DECODE_IPC_FILE, "rb") as f:
+                        cand = pickle.load(f)
+                except Exception:  # noqa: BLE001 (partial write / race) -> retry
+                    cand = None
+                if cand is not None and cand.get("ts", 0) >= self._setup_start_ts:
+                    payload = cand
+                    break
             if time.time() > deadline:
                 logger.warning(
-                    "Idle KV parking [prefill]: no decode IPC file at %s after %ds; "
-                    "peer may not be up. Parking inactive.",
+                    "Idle KV parking [prefill]: no FRESH decode IPC file at %s after "
+                    "%ds (stale-only or peer down). Parking inactive.",
                     DECODE_IPC_FILE,
                     RENDEZVOUS_TIMEOUT_S,
                 )
                 return
             time.sleep(1.0)
-
-        with open(DECODE_IPC_FILE, "rb") as f:
-            payload = pickle.load(f)
 
         peer_gpu = payload["gpu_id"]
         can_p2p = torch.cuda.can_device_access_peer(self.gpu_id, peer_gpu)
