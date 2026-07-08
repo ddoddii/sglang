@@ -515,7 +515,14 @@ class IdleKVParkManager:
             return False
         try:
             token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
-            token_ids = list(req.origin_input_ids) + list(req.output_ids)
+            # Park only the rendered prompt (origin_input_ids), NOT the generated
+            # output_ids. The next turn's request re-renders the assistant message via
+            # the chat template (esp. tool calls), whose tokens diverge from the raw
+            # generation — so origin+output is not a clean prefix of the next request and
+            # never prefix-matches. origin_input_ids, by contrast, IS a token-exact prefix
+            # of the next turn (chat templates concatenate messages), which is exactly the
+            # unit radix/hicache match on. Its KV sits at the first slots of req_to_token.
+            token_ids = list(req.origin_input_ids)
             n = (len(token_ids) // self.page_size) * self.page_size
             if n == 0 or token_indices.numel() < n:
                 return False
