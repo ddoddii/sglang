@@ -1609,6 +1609,11 @@ class Scheduler(
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Idle KV parking (slice 4b): pull this request's parked prefix back from
+            # the idle-GPU pool into the local radix before prefill, so match_prefix
+            # hits it instead of recomputing.
+            if self.idle_kv_park_manager is not None:
+                self.idle_kv_park_manager.maybe_fetch(req)
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads

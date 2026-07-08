@@ -166,6 +166,13 @@ class IdleKVParkManager:
         self._existing_sum = 0
         self._n_sum = 0
         self._received_msgs = 0  # park messages enqueued by the recv thread
+        # slice 4b: fetch-on-hit (prefill pulls a parked prefix back before prefill).
+        self._fetch_hits = 0        # requests whose parked prefix was fetched into radix
+        self._fetched_tokens = 0    # tokens copied park-GPU -> local + inserted
+        self._fetch_miss = 0        # request had no parked prefix
+        self._fetch_already = 0     # P already had the prefix (natural radix hit)
+        self._fetch_nospace = 0     # local KV pool full, could not stage the fetch
+        self._fetch_ms_sum = 0.0
 
         # slice 4: dedicated park pool on an idle GPU (survives P-GPU eviction).
         self.park_gpu = PARK_GPU
@@ -552,7 +559,7 @@ class IdleKVParkManager:
 
     # --- slice 4: dedicated idle-GPU park pool -------------------------------
     def _init_park_gpu_pool(self) -> None:
-        from collections import OrderedDict
+        from collections import Counter, OrderedDict
 
         dev = f"cuda:{self.park_gpu}"
         head_num, head_dim = self.k_buffer[0].shape[1], self.k_buffer[0].shape[2]
@@ -561,7 +568,10 @@ class IdleKVParkManager:
         N = PARK_POOL_TOKENS
         self._park_k = [torch.zeros(N, head_num, head_dim, dtype=dtype, device=dev) for _ in range(L)]
         self._park_v = [torch.zeros(N, head_num, head_dim, dtype=dtype, device=dev) for _ in range(L)]
-        self._park_index = OrderedDict()  # hash -> (start, n)
+        self._park_index = OrderedDict()  # hash(token_ids) -> (start, n)
+        # Distinct parked prefix lengths present in the index; fetch probes request[:L]
+        # only for these L (see _match_park_prefix).
+        self._park_lens = Counter()
         self._park_next = 0
         gb = 2 * N * head_num * head_dim * self.k_buffer[0].element_size() * L / 1e9
         logger.info(
@@ -598,10 +608,14 @@ class IdleKVParkManager:
             s0, ln = self._park_index[k]
             if not (s0 + ln <= start or s0 >= end):
                 del self._park_index[k]
+                self._park_lens[ln] -= 1
+                if self._park_lens[ln] <= 0:
+                    del self._park_lens[ln]
         t0 = time.perf_counter()
         self._gather_copy_peer_to_park(src_indices, start, n)
         ms = (time.perf_counter() - t0) * 1000.0
         self._park_index[h] = (start, n)
+        self._park_lens[n] += 1
         self._park_next = end % PARK_POOL_TOKENS
         self._copied_count += 1
         self._n_sum += n
@@ -614,6 +628,94 @@ class IdleKVParkManager:
                 self.park_gpu, "?", n, len(self.peer_k_buffer), ms,
                 len(self._park_index), self._park_next,
             )
+
+    # --- slice 4b: fetch-on-hit (pull a parked prefix back before prefill) -------
+    def _match_park_prefix(self, token_ids):
+        """Longest parked entry whose token_ids is a (page-aligned) prefix of
+        token_ids. Park entries are keyed by hash(their full token_ids); we probe
+        request[:L] for each distinct parked length L (descending) and return the
+        first (longest) hit as (start, n). O(#distinct lengths) hashes per request."""
+        if not self._park_lens:
+            return None
+        n_req = len(token_ids)
+        for L in sorted(self._park_lens, reverse=True):
+            if L > n_req:
+                continue
+            h = hash(tuple(token_ids[:L]))
+            ent = self._park_index.get(h)
+            if ent is not None and ent[1] == L:  # ent[1]==L guards hash collisions
+                self._park_index.move_to_end(h)  # LRU touch on read
+                return ent
+        return None
+
+    def _gather_copy_park_to_local(self, park_start, existing, n, dst_indices) -> None:
+        """Copy park-pool slots [park_start+existing : park_start+n] (idle GPU) ->
+        local KV-pool dst_indices (P GPU), across all layers. This is the fetch
+        direction: park_gpu -> P (PCIe on this topology, NVLink if paired)."""
+        local_dev = f"cuda:{self.gpu_id}"
+        d = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
+        lo, hi = park_start + existing, park_start + n
+        for layer in range(len(self.k_buffer)):
+            self.k_buffer[layer][d] = self._park_k[layer][lo:hi].to(local_dev)
+            self.v_buffer[layer][d] = self._park_v[layer][lo:hi].to(local_dev)
+        torch.cuda.synchronize(self.gpu_id)
+
+    def maybe_fetch(self, req: "Req") -> int:
+        """P: before a request enters prefill, pull its parked prefix from the idle-GPU
+        pool back into the local KV pool + radix, so the scheduler prefix-hits instead
+        of recomputing. Returns #tokens fetched (0 if none). Runs on the scheduler main
+        thread (allocator-safe). Park-GPU mode only (slice 4b)."""
+        if self.role != "prefill" or self.park_gpu is None or not self._park_index:
+            return 0
+        try:
+            token_ids = list(getattr(req, "origin_input_ids", None) or [])
+        except Exception:  # noqa: BLE001
+            return 0
+        if not token_ids:
+            return 0
+        hit = self._match_park_prefix(token_ids)
+        if hit is None:
+            self._fetch_miss += 1
+            return 0
+        start, n = hit
+        key = RadixKey(token_ids[:n], extra_key=None)
+        existing = len(self.tree_cache.match_prefix(key).device_indices)
+        if existing >= n:
+            self._fetch_already += 1  # P still has it (natural hit); nothing to stage
+            return 0
+        dst = self.token_to_kv_pool_allocator.alloc(n)
+        if dst is None:
+            self._fetch_nospace += 1
+            return 0
+        dst_list = dst.detach().to("cpu", torch.int64).tolist()
+        inserted_into_tree = False
+        try:
+            t0 = time.perf_counter()
+            # Copy only the tail P lacks; dst[:existing] is freed after insert matches it.
+            self._gather_copy_park_to_local(start, existing, n, dst_list[existing:n])
+            ms = (time.perf_counter() - t0) * 1000.0
+            new_prefix_len = self.tree_cache.insert(key, dst.to(torch.int64))
+            inserted_into_tree = True  # tree now owns dst[new_prefix_len:]
+            if new_prefix_len > 0:
+                self.token_to_kv_pool_allocator.free(dst[:new_prefix_len])
+        except Exception:
+            if not inserted_into_tree:
+                self.token_to_kv_pool_allocator.free(dst)  # rollback whole alloc
+            raise
+        fetched = n - new_prefix_len
+        self._fetch_hits += 1
+        self._fetched_tokens += fetched
+        self._fetch_ms_sum += ms
+        if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
+            logger.info(
+                "Idle KV parking [prefill] GPU%d-fetch: rid=%s pulled %d tok "
+                "(P had %d of %d) x %d layers in %.1fms. total fetch hits=%d, "
+                "tokens=%d, avg=%.1fms.",
+                self.park_gpu, getattr(req, "rid", "?"), fetched, existing, n,
+                len(self.k_buffer), ms, self._fetch_hits, self._fetched_tokens,
+                self._fetch_ms_sum / max(1, self._fetch_hits),
+            )
+        return fetched
 
     def _receive_park(self, msg: dict) -> None:
         src_indices = msg["kv_indices"]
@@ -719,11 +821,14 @@ class IdleKVParkManager:
             if present:
                 survived += 1
         surv_rate = (survived / checked) if checked else -1.0
+        fetch_attempts = (
+            self._fetch_hits + self._fetch_miss + self._fetch_already + self._fetch_nospace
+        )
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
-            "H1(retain):skip↑had↑  H2(evict):survival↓  H3(no-match):survival↑reuse-flat  "
-            "BACKLOG:recv≫processed=copy-too-slow",
+            "FETCH: hits=%d tok=%d avg=%.1fms | miss=%d already=%d nospace=%d (of %d) | "
+            "H1(retain):skip↑had↑  H2(evict):survival↓  H3(no-match):survival↑reuse-flat",
             self._received_msgs,
             total,
             self._incoming.qsize(),
@@ -734,4 +839,11 @@ class IdleKVParkManager:
             surv_rate * 100 if surv_rate >= 0 else -1,
             survived,
             checked,
+            self._fetch_hits,
+            self._fetched_tokens,
+            self._fetch_ms_sum / max(1, self._fetch_hits),
+            self._fetch_miss,
+            self._fetch_already,
+            self._fetch_nospace,
+            fetch_attempts,
         )

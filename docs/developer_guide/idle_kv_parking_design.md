@@ -291,3 +291,29 @@ PREFILL_MAX_TOTAL_TOKENS=40000 CONCURRENCY=8 TOOL_DELAY=3 \
 `benchmark/head_to_head_analyze.py`가 각 arm의 벤치 summary(TTFT/TPOT/throughput)와 reuse delta(reuse_ratio/cached/L2_used)를 하나의 표로 병합하고, `park vs hicache` TTFT 격차 + `park.reuse ≈ radix.reuse` 진단을 출력한다.
 
 **이 head-to-head가 확인하면** Phase 1은 "park 아이디어는 이 하드웨어에서 host-DRAM hicache 대비 실익 없음"을 *메커니즘(reuse 미개선)*까지 규명하고 닫힌다. 아이디어 자체의 가치는 §9의 토폴로지 조건(all-to-all NVLink / NVLink-paired spare / multi-node)에서만 실현된다.
+
+## 11. Slice 4b — fetch-on-hit 구현 (GPU2 저장 → 다음 turn P로 fetch)
+
+§10의 park(4a)는 **저장만** 해서 reuse가 radix와 같았다(무이득). "PCIe라도 recompute보다 빠를 것"이라는 가설을 실제로 측정하려면 **fetch 경로**가 필요하다 — 이것을 구현했다(slice 4b).
+
+**동작**: prefill 노드가 새 요청을 큐에 넣기 직전(`scheduler._add_request_to_queue`의 PREFILL 분기), `IdleKVParkManager.maybe_fetch(req)`가:
+1. 요청 token_ids의 **가장 긴 parked prefix**를 park 인덱스에서 찾고(`_match_park_prefix`: 저장된 각 길이 L에 대해 `hash(req[:L])` 조회, 내림차순 → 최장 hit; `ent[1]==L`로 해시충돌 방어),
+2. P가 이미 가진 부분(`match_prefix`)을 빼고 **부족한 tail만** park 풀(GPU2)에서 로컬 KV 풀(GPU0)로 gather-copy(`_gather_copy_park_to_local`, GPU2→GPU0 = 이 토폴로지선 PCIe),
+3. radix tree에 insert → 이후 스케줄러의 `match_prefix`가 **prefix-hit** → prefill이 그만큼 재계산을 건너뜀 → TTFT↓, `cached_tokens`↑.
+
+race 안전: fetch·park 모두 스케줄러 **메인 스레드**에서만 인덱스를 만짐(ZMQ recv 스레드는 큐 적재만). park는 D 시점의 KV를 GPU2로 **복사 스냅샷**하므로 D의 슬롯 재사용과 무관.
+
+**수정 파일**: `disaggregation/idle_kv_parking.py`(`maybe_fetch`, `_match_park_prefix`,
+`_gather_copy_park_to_local`, `_park_lens` 유지, fetch DIAG), `managers/scheduler.py`(PREFILL 분기 훅).
+
+**검증**: prefix-match 알고리즘(최장 prefix·충돌 방어·wrap eviction)을 standalone 단위테스트로 통과.
+prefill 로그의 `GPU%d-fetch` / DIAG의 `FETCH: hits/tok/avg-ms | miss/already/nospace`로 실동작 관측.
+
+**측정 (재실행 필요)**: `run_head_to_head.sh`를 다시 돌리면 park arm이 이제 fetch를 수행한다.
+분석기(`head_to_head_analyze.py`)가 두 핵심 질문을 출력:
+- **결론 1 — park(fetch) vs radix(recompute)**: `park.reuse > radix.reuse`면 fetch가 prefix-hit을
+  만들어 recompute를 대체(가설 성립). TTFT가 radix보다 낮으면 "PCIe fetch < recompute" 확인.
+- **결론 2 — park(GPU-fetch, PCIe) vs hicache(host-DRAM fetch, PCIe)**: 예상 **≈ 동률**
+  (둘 다 PCIe·recompute 회피, 전송은 TTFT의 수%). GPU2 풀(26GB) < host(125GB)로 용량은 열위.
+  → 4b는 §9/§10 결론("이 토폴로지선 hicache 재현이 상한, NVLink-paired/멀티노드에서만 우위")을
+  end-to-end로 검증하는 실험이다.
