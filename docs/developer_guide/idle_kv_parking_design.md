@@ -193,3 +193,32 @@ Turn N+1:
 ## 9. 관련 연구 및 현실성 평가
 
 아이디어의 학술적 위치(OrbitCache 유추, Mooncake/MemServe/AttentionStore/CacheGen 등 관련 연구), fetch-vs-recompute 정량 검증, 현실성/차별화 평가는 별도 문서 참고: [`idle_kv_parking_related_work.md`](./idle_kv_parking_related_work.md)
+
+---
+
+## 9. Phase 1 결과 — Design A(P GPU radix park)는 1P1D에서 실패 (데이터 확정)
+
+슬라이스 2a~3d로 전송·복사·radix insert 파이프라인을 **정확성까지 완비**했다(2a IPC 52.7 GB/s, 2b gather-copy MATCH, 3c insert 200/200 정확). 그러나 실제 이득 측정에서 **파킹은 reuse/TTFT를 개선하지 못했다.**
+
+### 측정 (radix, pool 40000, C=8, TOOL_DELAY=3, BFCL multi-turn)
+| | reuse_ratio | avg TTFT | success |
+|---|---|---|---|
+| 파킹 OFF (A) | 0.392 | 1.848s | 200/200 |
+| 파킹 ON (B) | 0.375 | 1.838s | 200/200 |
+
+→ 차이 없음(노이즈). 계측(DIAG)으로 원인 확정:
+```
+recv=246 processed=30 | skip=0 copy=30 avg-P-had=0.95 | survival=0%
+```
+
+### 근본 원인
+1. **alloc 실패 88%**: 압박 상태에서 P KV 풀이 꽉 차 파킹 슬롯 할당 불가 → 216/246 드롭.
+2. **survival 0%**: 복사된 소수도 hit 전에 즉시 evict.
+3. 무압박 시엔 `avg-P-had≈0.99` → P가 이미 prefix 보유 → 파킹은 생성 토큰(~5%)만 추가 = 무의미.
+
+**결론**: "유휴 P GPU" 전제가 압박과 모순한다. P가 evict할 만큼 압박받는 순간(파킹이 필요한 그때) P GPU엔 여유가 없다. **Design A는 병목과 동일 자원(P GPU)을 노려 1P1D에서 구조적으로 무효.** Phase 0에서 실제로 이긴 건 **host DRAM(별도·대용량 tier)**이었다는 사실과 정합.
+
+### Pivot 방향 (후보)
+- **P host DRAM로 강등** (원래 아이디어의 Tier3): P GPU alloc 실패 시 host pool(125GB, GPU 풀 때도 여유)로. Phase 0의 검증된 승자. NVLink는 D→P GPU 전송에만 기여, 이후 P GPU→host.
+- **진짜 유휴 3번째 GPU**를 park 풀로 (4×A6000에서 GPU2/3). "유휴 GPU spare" 전제를 실제 여유 자원으로 검증. 단 NVLink 쌍(0-1,2-3) 토폴로지 제약.
+- **파킹 엔트리 protect(priority)**: evict 방어. 단 active prefill 자원과 trade-off.
