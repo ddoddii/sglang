@@ -171,8 +171,15 @@ class IdleKVParkManager:
         self._fetched_tokens = 0    # tokens copied park-GPU -> local + inserted
         self._fetch_miss = 0        # request had no parked prefix
         self._fetch_already = 0     # P already had the prefix (natural radix hit)
-        self._fetch_nospace = 0     # local KV pool full, could not stage the fetch
+        self._fetch_nospace = 0     # KV pool full even after evict-to-room (gave up)
+        self._fetch_evicted = 0     # had to LRU-evict cold entries to make room (like hicache)
         self._fetch_ms_sum = 0.0
+        # async fetch: enqueue the GPU2->GPU0 copy on the default stream and DON'T
+        # host-synchronize. SGLang does forward_stream.wait_stream(default_stream)
+        # before every forward, so the copy is guaranteed complete before the model
+        # reads the KV -- correct without blocking the scheduler for the copy (~235ms).
+        # Set SGLANG_KV_PARK_SYNC_FETCH=1 to fall back to the blocking copy.
+        self.sync_fetch = os.environ.get("SGLANG_KV_PARK_SYNC_FETCH", "0") == "1"
 
         # slice 4: dedicated park pool on an idle GPU (survives P-GPU eviction).
         self.park_gpu = PARK_GPU
@@ -658,14 +665,21 @@ class IdleKVParkManager:
     def _gather_copy_park_to_local(self, park_start, existing, n, dst_indices) -> None:
         """Copy park-pool slots [park_start+existing : park_start+n] (idle GPU) ->
         local KV-pool dst_indices (P GPU), across all layers. This is the fetch
-        direction: park_gpu -> P (PCIe on this topology, NVLink if paired)."""
+        direction: park_gpu -> P (PCIe on this topology, NVLink if paired).
+
+        Async by default: the copy is enqueued on the P-GPU default stream and NOT
+        host-synchronized, so the scheduler is not blocked for the copy. Correctness
+        holds because SGLang runs forward_stream.wait_stream(default_stream) before
+        each forward, ordering this copy ahead of any model read of the KV. The park
+        source (GPU2) was synchronized at park time, so it is stable to read."""
         local_dev = f"cuda:{self.gpu_id}"
         d = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
         lo, hi = park_start + existing, park_start + n
         for layer in range(len(self.k_buffer)):
             self.k_buffer[layer][d] = self._park_k[layer][lo:hi].to(local_dev)
             self.v_buffer[layer][d] = self._park_v[layer][lo:hi].to(local_dev)
-        torch.cuda.synchronize(self.gpu_id)
+        if self.sync_fetch:
+            torch.cuda.synchronize(self.gpu_id)
 
     def maybe_fetch(self, req: "Req") -> int:
         """P: before a request enters prefill, pull its parked prefix from the idle-GPU
@@ -692,8 +706,28 @@ class IdleKVParkManager:
             return 0
         dst = self.token_to_kv_pool_allocator.alloc(n)
         if dst is None:
-            self._fetch_nospace += 1
-            return 0
+            # evict-to-room (like hicache): the P GPU pool is full, but the cold
+            # entries we evict are safe -- their KV is still in the park pool (or
+            # cheaply recomputable). LRU-evict enough to stage this (hotter) prefix,
+            # then retry. This is exactly what the scheduler does under pressure.
+            try:
+                self.tree_cache.evict(n)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Idle KV parking [prefill]: evict-to-room failed: %r", e)
+            dst = self.token_to_kv_pool_allocator.alloc(n)
+            if dst is None:
+                self._fetch_nospace += 1  # still no room even after eviction
+                return 0
+            self._fetch_evicted += 1
+            # evict(n) may have dropped part of the prefix `existing` measured above.
+            # Re-measure so we copy exactly the tail P now lacks (the park pool holds
+            # the full prefix, so any tail is safe to copy). Otherwise dst slots in
+            # (new_existing, old_existing] would be inserted uninitialized.
+            existing = len(self.tree_cache.match_prefix(key).device_indices)
+            if existing >= n:
+                self.token_to_kv_pool_allocator.free(dst)
+                self._fetch_already += 1
+                return 0
         dst_list = dst.detach().to("cpu", torch.int64).tolist()
         inserted_into_tree = False
         try:
@@ -834,8 +868,8 @@ class IdleKVParkManager:
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
-            "FETCH: hits=%d tok=%d avg=%.1fms | miss=%d already=%d nospace=%d (of %d) | "
-            "H1(retain):skip↑had↑  H2(evict):survival↓  H3(no-match):survival↑reuse-flat",
+            "FETCH: hits=%d(evict-to-room=%d) tok=%d avg=%.1fms | "
+            "miss=%d already=%d nospace=%d (of %d)",
             self._received_msgs,
             total,
             self._incoming.qsize(),
@@ -847,6 +881,7 @@ class IdleKVParkManager:
             survived,
             checked,
             self._fetch_hits,
+            self._fetch_evicted,
             self._fetched_tokens,
             self._fetch_ms_sum / max(1, self._fetch_hits),
             self._fetch_miss,
