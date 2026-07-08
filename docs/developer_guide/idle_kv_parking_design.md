@@ -320,9 +320,13 @@ fix 후:
 
 | arm | reuse_ratio | TTFT | vs radix |
 |---|---|---|---|
-| radix (recompute) | 0.389 | 1.832s | — |
+| radix (GPU prefix cache) | 0.389 | 1.832s | — |
 | **park (fetch)** | **0.450** | 1.829s | **−0.2%** (무승부) |
 | hicache | 0.744 | 1.381s | −24.6% |
+
+> **radix는 "재계산 baseline"이 아니다** — RadixAttention prefix cache라 GPU 잔존 prefix는 hit한다
+> (reuse 0.39). radix가 recompute하는 건 hit 못한 토큰뿐: ①매 turn 새 토큰(~26% floor, 어떤 캐시도
+> 불가피) + ②축출된 prefix. parking이 겨냥하는 건 ②뿐이고, ②는 강압박(pool 40k)에서만 존재한다.
 
 → **fetch-on-hit은 실제로 동작**(reuse 0.39→0.45, +217k 토큰이 재계산 대신 fetch됨). **그러나 순
 TTFT 이득은 ~0.** DIAG가 원인을 특정:
@@ -375,7 +379,7 @@ host-offload 계층은 순수 오버헤드. hicache의 우위는 오직 강압�
 ### Phase 1 최종 결론 (idle KV parking, 2×A6000 단일 노드)
 
 fetch-on-hit(4b)까지 완비해 end-to-end로 검증한 결과, **park+fetch는 이 하드웨어의 어느
-operating point에서도 radix(recompute) 대비 순 이득이 없다.** 근본 원인은 구현 디테일이 아니라
+operating point에서도 radix(GPU prefix cache) 대비 순 이득이 없다.** 근본 원인은 구현 디테일이 아니라
 구조적 catch-22다:
 - 파킹의 가치 = P가 prefix를 evict할 때(압박) 재계산을 fetch로 대체하는 것.
 - 그러나 **fetch한 KV는 attention이 읽으려면 병목인 P GPU 풀에 다시 들어가야 한다**(nospace) —
