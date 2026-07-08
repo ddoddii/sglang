@@ -309,11 +309,46 @@ race 안전: fetch·park 모두 스케줄러 **메인 스레드**에서만 인�
 **검증**: prefix-match 알고리즘(최장 prefix·충돌 방어·wrap eviction)을 standalone 단위테스트로 통과.
 prefill 로그의 `GPU%d-fetch` / DIAG의 `FETCH: hits/tok/avg-ms | miss/already/nospace`로 실동작 관측.
 
-**측정 (재실행 필요)**: `run_head_to_head.sh`를 다시 돌리면 park arm이 이제 fetch를 수행한다.
-분석기(`head_to_head_analyze.py`)가 두 핵심 질문을 출력:
-- **결론 1 — park(fetch) vs radix(recompute)**: `park.reuse > radix.reuse`면 fetch가 prefix-hit을
-  만들어 recompute를 대체(가설 성립). TTFT가 radix보다 낮으면 "PCIe fetch < recompute" 확인.
-- **결론 2 — park(GPU-fetch, PCIe) vs hicache(host-DRAM fetch, PCIe)**: 예상 **≈ 동률**
-  (둘 다 PCIe·recompute 회피, 전송은 TTFT의 수%). GPU2 풀(26GB) < host(125GB)로 용량은 열위.
-  → 4b는 §9/§10 결론("이 토폴로지선 hicache 재현이 상한, NVLink-paired/멀티노드에서만 우위")을
-  end-to-end로 검증하는 실험이다.
+### 측정 결과 (pool 40000 = 강압박, C=8, delay 3s, 200 items)
+
+**초기 버그**: 처음엔 `origin_input_ids + output_ids`를 park key로 저장 → tool-call turn에서
+클라이언트가 assistant 메시지를 template로 재렌더링하면 raw 생성 토큰과 어긋나 prefix-match
+거의 실패(reuse 0.39→0.41, 무개선). **fix: 프롬프트(`origin_input_ids`)만 park** — 이건 다음
+turn의 token-exact prefix라 radix/hicache가 매칭하는 단위와 동일.
+
+fix 후:
+
+| arm | reuse_ratio | TTFT | vs radix |
+|---|---|---|---|
+| radix (recompute) | 0.389 | 1.832s | — |
+| **park (fetch)** | **0.450** | 1.829s | **−0.2%** (무승부) |
+| hicache | 0.744 | 1.381s | −24.6% |
+
+→ **fetch-on-hit은 실제로 동작**(reuse 0.39→0.45, +217k 토큰이 재계산 대신 fetch됨). **그러나 순
+TTFT 이득은 ~0.** DIAG가 원인을 특정:
+```
+FETCH: hits=26 tok=95009 avg=235.8ms | miss=206 already=278 nospace=237 (of 747)
+survival=100% (32/32)  avg-P-had=0.00
+```
+- **nospace 32%**: fetch한 KV는 attention이 읽으려면 **압박받는 P GPU 풀에 다시 넣어야** 하는데,
+  pool 40000이 꽉 차 `alloc(n)` 실패 → 3분의 1이 stage 불가. **저장은 유휴 GPU로 offload해도
+  restore는 병목(P GPU)을 점유해야 한다** — Design A의 병목이 restore 쪽에서 재발.
+- **already 37%**: P가 아직 prefix 보유(evict 안 됨) → fetch 불필요(정상).
+- **hits 3.5%(26)**: "P가 evict했고 && parked됐고 && 자리 있음" 창이 매우 좁음.
+- **avg 235ms/fetch**: 32-layer 동기 gather-copy(GPU2→GPU0). 현 hit 수(26)에선 총 6s(전체의 1.3%)라
+  묻히지만, hit이 늘면 병목이 된다.
+
+**hicache가 이기는 이유(0.74 vs 0.45)**: 같은 "P GPU로 restore" 제약을 받지만 (a) 풀 차면 LRU
+evict로 자리 확보, (b) **async** prefetch. 본 구현은 (a) alloc 실패시 포기, (b) 동기 복사.
+
+**해석**: "PCIe fetch > recompute"는 **reuse 레벨에선 참**이나, 이 강압박 워크로드에선 회수량이
+작고(nospace가 막음) 동기 복사가 있어 **순 TTFT는 무승부**. 근본 한계는 **restore가 병목 P GPU를
+점유**해야 한다는 것.
+
+### 압박 완화 스윕 (pool sweep, 진행 중)
+
+nospace 32%가 강압박(pool 40000) 탓이므로, P 풀을 키워 restore 자리를 주고 재측정한다
+(`run_head_to_head_pool_sweep.sh`, POOLS=60000/80000/120000). 상충: 풀↑ → nospace↓ 지만 radix도
+evict를 덜 해(reuse↑) hicache와 격차가 닫힘 → park이 되찾을 여지도 감소. **스윗스팟**(radix가
+아직 evict하지만 restore 자리가 있는 pool)에서 park이 radix를 이기는지 확인. `head_to_head_pool_
+compare.py`가 pool별 park-vs-radix-vs-hicache를 한 표로 출력.
