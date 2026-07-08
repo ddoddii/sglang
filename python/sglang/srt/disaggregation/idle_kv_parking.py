@@ -52,7 +52,7 @@ PARK_DIR = os.environ.get("SGLANG_KV_PARK_DIR", "/dev/shm/sglang_kv_parking")
 # (Should move to environ.py for upstream; os.environ for research iteration.)
 _PARK_GPU_ENV = os.environ.get("SGLANG_KV_PARK_GPU")
 PARK_GPU = int(_PARK_GPU_ENV) if _PARK_GPU_ENV not in (None, "") else None
-PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "100000"))
+PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "200000"))
 # Decode publishes its KV-pool IPC handles here; prefill consumes them.
 DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
 # Prefill publishes its ZMQ park-control PULL address here; decode connects a PUSH.
@@ -177,7 +177,7 @@ class IdleKVParkManager:
             self._init_park_gpu_pool()
         from collections import deque as _deque
 
-        self._recent_parked = _deque(maxlen=16)  # (token_ids, n) samples for survival probe
+        self._recent_parked = _deque(maxlen=32)  # recent parks for survival probe
 
         # Run setup off the hot path so server startup is not blocked.
         threading.Thread(
@@ -605,8 +605,7 @@ class IdleKVParkManager:
         self._park_next = end % PARK_POOL_TOKENS
         self._copied_count += 1
         self._n_sum += n
-        if self._copied_count % 8 == 0:
-            self._recent_parked.append((h, n))
+        self._recent_parked.append((h, n))  # dense: reflects the next-turn window
         if self._parked_count <= 5 or self._copied_count % 50 == 0:
             self._parked_count += 1
             logger.info(
