@@ -241,3 +241,47 @@ Design A 실패 원인(P GPU 병목)을 우회하려 **전용 유휴 GPU(GPU2)�
 - 결국 4b는 Phase 0의 `hicache_host`(2.40s→1.45s)를 **재현**할 뿐, NVLink 이점은 P↔D에만 존재.
 
 **Phase 1 종합 결론**: "유휴 자원으로 KV parking" 아이디어는 (1) 전송(NVLink P↔D 52GB/s)·(2) 용량(유휴 GPU 100% survival) 각각은 검증됐으나, **이 2×A6000(쌍별 NVLink) 토폴로지에선 두 이점이 한 경로에서 결합되지 않는다** — NVLink는 P-D에만, 여유 GPU는 PCIe로만 접근. 아이디어가 실익을 내려면 **all-to-all NVLink(NVSwitch/DGX)** 또는 **여유 GPU가 P와 NVLink로 연결된 배치**, 혹은 **진짜 multi-node(aggregate GPU memory ≫ single host)** 가 필요하다. 파이프라인(2a~4a) 코드는 그런 환경에서 재사용 가능한 자산으로 남긴다.
+
+## 10. Head-to-head — park(4a) vs host-DRAM hicache (Phase 1 마무리)
+
+§9의 결론("park 저장 티어는 검증됐으나 이 토폴로지에선 host-DRAM hicache를 넘지 못한다")을 **동일 압박에서 back-to-back 수치**로 못박는다. 3개 arm을 한 자리에서(cross-run drift 제거) 측정:
+
+| arm | 구성 | 역할 |
+|---|---|---|
+| `radix` | GPU-only prefix cache | park의 현실적 base (fetch 통합 없음) |
+| `hicache` | + host-DRAM L2 (통합된 fetch 경로) | 이겨야 할 incumbent |
+| `park` | radix + 전용 유휴 GPU2 park 풀(4a) | fetch 미통합 저장 티어 |
+
+### 이미 확보된 증거 (기존 phase0p_p40000_c8_d3 delta)
+
+핵심 메커니즘은 이미 데이터에 있다 — **hicache가 이기는 이유는 대역폭이 아니라 "evict된 prefix를 host DRAM에 담아 다시 fetch"하는 통합 경로**다:
+
+| arm | reuse_ratio | uncached(recompute) tok | TTFT(metric) |
+|---|---|---|---|
+| radix | **0.257** | 2.85M | 2.09s |
+| hicache_host | **0.743** | 0.98M | 1.33s |
+
+radix 대비 hicache는 reuse를 **2.9×**(26%→74%) 끌어올려 재계산 토큰을 1/3로 줄인다 → TTFT 2.40s→1.45s.
+
+### 예측 (park arm)
+
+park(4a)은 KV를 GPU2에 **저장만** 하고 prefill 경로가 그것을 읽는 **fetch-on-hit(4b)이 없다**. 따라서:
+- `park.reuse_ratio ≈ radix.reuse_ratio ≈ 0.26` (park은 prefix-hit을 만들지 못함)
+- `park.TTFT ≈ radix.TTFT` ≫ `hicache.TTFT`
+
+즉 **저장 티어를 추가하는 것만으로는 이득이 없고**, 병목은 대역폭이 아니라 *fetch 통합*이다. 그리고 fetch(4b)를 붙여도 이 토폴로지에선 GPU2→GPU0가 PCIe(§9)라 host-DRAM hicache와 동률이 상한.
+
+### 실행 (turnkey)
+
+```bash
+cd ~/experiments
+# 3개 arm 자동 순회: start → /metrics before → BFCL → /metrics after → delta → stop
+PREFILL_MAX_TOTAL_TOKENS=40000 CONCURRENCY=8 TOOL_DELAY=3 \
+  ./scripts/sglang/run_head_to_head.sh
+# 결과 표 + 판정:
+#   results/head_to_head/h2h_p40000_c8_d3/head_to_head_summary.json
+```
+
+`benchmark/head_to_head_analyze.py`가 각 arm의 벤치 summary(TTFT/TPOT/throughput)와 reuse delta(reuse_ratio/cached/L2_used)를 하나의 표로 병합하고, `park vs hicache` TTFT 격차 + `park.reuse ≈ radix.reuse` 진단을 출력한다.
+
+**이 head-to-head가 확인하면** Phase 1은 "park 아이디어는 이 하드웨어에서 host-DRAM hicache 대비 실익 없음"을 *메커니즘(reuse 미개선)*까지 규명하고 닫힌다. 아이디어 자체의 가치는 §9의 토폴로지 조건(all-to-all NVLink / NVLink-paired spare / multi-node)에서만 실현된다.
