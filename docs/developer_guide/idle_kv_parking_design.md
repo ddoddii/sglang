@@ -222,3 +222,22 @@ recv=246 processed=30 | skip=0 copy=30 avg-P-had=0.95 | survival=0%
 - **P host DRAM로 강등** (원래 아이디어의 Tier3): P GPU alloc 실패 시 host pool(125GB, GPU 풀 때도 여유)로. Phase 0의 검증된 승자. NVLink는 D→P GPU 전송에만 기여, 이후 P GPU→host.
 - **진짜 유휴 3번째 GPU**를 park 풀로 (4×A6000에서 GPU2/3). "유휴 GPU spare" 전제를 실제 여유 자원으로 검증. 단 NVLink 쌍(0-1,2-3) 토폴로지 제약.
 - **파킹 엔트리 protect(priority)**: evict 방어. 단 active prefill 자원과 trade-off.
+
+### 슬라이스 4 — 유휴 GPU park 풀 (용량 전제는 검증, 하드웨어 이점은 없음)
+
+Design A 실패 원인(P GPU 병목)을 우회하려 **전용 유휴 GPU(GPU2)에 park 풀**을 두었다.
+
+**4a 실측 (pool 200k=26GB @ GPU2, radix, pool 40000, C=8, TOOL_DELAY=3)**
+| | Design A (P GPU) | 4a (GPU2 전용 풀) |
+|---|---|---|
+| 드롭(alloc-fail) | 88% (recv 246→proc 30) | **0%** (recv 260→proc 260) |
+| survival | 0% | **100% (32/32)** |
+
+→ **여유 GPU tier는 두 실패모드(alloc-fail·evict)를 모두 제거한다. 용량 전제 검증 완료.**
+
+**그러나 이 하드웨어에서 reuse 이득(4b: GPU2→GPU0 fetch-on-prefill)은 기존 host-DRAM hicache를 넘지 못한다:**
+- `nvidia-smi topo -m`: GPU0(P)↔GPU2(park) = `NODE`(PCIe). NVLink 쌍은 (0-1),(2-3)뿐 → park↔fetch 경로가 **PCIe** = host DRAM fetch와 동일 속도.
+- GPU2 풀(26GB) < host RAM(125GB) → 용량 열위.
+- 결국 4b는 Phase 0의 `hicache_host`(2.40s→1.45s)를 **재현**할 뿐, NVLink 이점은 P↔D에만 존재.
+
+**Phase 1 종합 결론**: "유휴 자원으로 KV parking" 아이디어는 (1) 전송(NVLink P↔D 52GB/s)·(2) 용량(유휴 GPU 100% survival) 각각은 검증됐으나, **이 2×A6000(쌍별 NVLink) 토폴로지에선 두 이점이 한 경로에서 결합되지 않는다** — NVLink는 P-D에만, 여유 GPU는 PCIe로만 접근. 아이디어가 실익을 내려면 **all-to-all NVLink(NVSwitch/DGX)** 또는 **여유 GPU가 P와 NVLink로 연결된 배치**, 혹은 **진짜 multi-node(aggregate GPU memory ≫ single host)** 가 필요하다. 파이프라인(2a~4a) 코드는 그런 환경에서 재사용 가능한 자산으로 남긴다.
