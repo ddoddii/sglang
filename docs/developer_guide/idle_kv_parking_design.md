@@ -396,3 +396,40 @@ hicache를 **재현**할 수 있으나, 이 토폴로지선 GPU2→GPU0가 PCIe(
 attention**(restore가 P GPU를 점유하지 않아도 됨), 또는 (2) host DRAM이 유일 로컬 tier이고 원격
 GPU 합산 용량이 host를 압도하는 **진짜 multi-node**. 단일 노드 단일 GPU-tier로는 hicache가 이미
 상한. 파이프라인 코드(2a~4b: IPC/P2P/park/fetch)는 그런 환경의 재사용 자산으로 남긴다.
+
+## 12. 정정 — evict-to-room + async로 park이 hicache와 대등해짐 (§9–§11 결론 supersede)
+
+⚠️ **§10/§11의 "catch-22라 park이 실익 없음" 결론은 틀렸다.** 그건 (a) fetch가 자리를 못 잡으면
+포기하는 **evict-to-room 부재**와, (b) prefill이 이전 run의 죽은 decode IPC 핸들을 열어 파킹 setup이
+조용히 죽던 **stale-IPC rendezvous 버그** 때문이었다. 둘을 고치자 park은 설계대로(hicache처럼) 동작한다.
+
+**고친 것:**
+- **evict-to-room (LRU)**: `maybe_fetch`에서 `alloc(n)` 실패 시 `tree_cache.evict(n)`(스케줄러가 압박
+  시 쓰는 그 API)로 콜드 축출 후 재시도. 축출 KV는 park 풀에 안전. evict가 방금 잰 `existing`을
+  바꿀 수 있어 evict 후 재측정해 tail만 정확히 복사.
+- **async fetch**: GPU2→GPU0 복사를 default stream에 올리고 host-sync 제거. SGLang이 매 forward 전
+  `forward_stream.wait_stream(default_stream)` 하므로 복사가 모델 read보다 먼저 완료 — 정확하면서
+  스케줄러 235ms 블로킹 제거. `SGLANG_KV_PARK_SYNC_FETCH=1`로 동기 fallback.
+- **stale-IPC 수정**: prefill이 자기 시작 ts 이후 publish된 fresh decode IPC 파일만 수용 +
+  start 스크립트가 `/dev/shm/sglang_kv_parking`를 매 restart 정리.
+
+**측정 (수정된 파킹, C=8, delay 3s, 200 items):**
+
+| pool | radix TTFT/reuse | hicache TTFT/reuse | park TTFT/reuse | park vs radix | park vs hicache |
+|---|---|---|---|---|---|
+| 40000 (강압박) | 1.83 / 0.38 | 1.38 / 0.74 | **1.35 / 0.74** | **−26%** | −2.5% |
+| 60000 | 1.20 / 0.74 | 1.34 / 0.74 | 1.36 / 0.74 | +13% | +1.2% |
+| 80000 | 1.22 / 0.74 | 1.32 / 0.74 | 1.35 / 0.74 | +11% | +2.9% |
+| 120000 | 1.12 / 0.74 | 1.27 / 0.75 | 1.31 / 0.74 | +17% | +3.4% |
+
+강압박 DIAG: `opened peer KV pool ... MATCH 52.8 GB/s → GPU2-park → GPU2-fetch pulled 5355 tok
+(P had 87 of 5442) in 50.6ms(첫)→3.1ms(async)`, nospace≈0.
+
+**정정된 결론:**
+- **park은 동작하며 host-DRAM hicache와 대등하다** — 강압박서 축출 prefix를 되찾아 reuse 0.38→0.74,
+  TTFT −26% vs radix (hicache −24%). 모든 pool에서 park ≈ hicache (차이 ~1~3.5%).
+- **복구 tier는 압박-조건부 이득**: 무압박(pool≥60k)에선 축출이 없어 park·hicache 모두 순수
+  오버헤드로 radix보다 +11~17% 느림 → 실전은 압박 감지 시에만 tier 활성화하는 적응형이 맞다.
+- **§9의 토폴로지 논지는 "park의 *우위* 조건"으로 유효**: 이 PCIe 단일 노드선 park = hicache(동률);
+  park이 hicache를 *넘어서려면* NVLink-paired 유휴 GPU(전송 2×) 또는 host-DRAM 부족/경합 환경이
+  필요. 즉 §9~§11이 "근본 불가"로 오독한 것을 "동률, 우위는 조건부"로 바로잡는다.
