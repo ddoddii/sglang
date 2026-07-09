@@ -186,6 +186,10 @@ class IdleKVParkManager:
         # reads the KV -- correct without blocking the scheduler for the copy (~235ms).
         # Set SGLANG_KV_PARK_SYNC_FETCH=1 to fall back to the blocking copy.
         self.sync_fetch = os.environ.get("SGLANG_KV_PARK_SYNC_FETCH", "0") == "1"
+        # Also park the decode-generated KV (not just the prompt prefix) so a next turn
+        # can reuse it when the assistant tokens recur. Set SGLANG_KV_PARK_GEN=0 to park
+        # the prefix only (the earlier behavior) for a clean A/B of the generated gain.
+        self.park_gen = os.environ.get("SGLANG_KV_PARK_GEN", "1") == "1"
 
         # slice 4: dedicated park pool on an idle GPU (survives P-GPU eviction).
         self.park_gpu = PARK_GPU
@@ -537,24 +541,31 @@ class IdleKVParkManager:
             return False
         try:
             token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
-            # Park only the rendered prompt (origin_input_ids), NOT the generated
-            # output_ids. The next turn's request re-renders the assistant message via
-            # the chat template (esp. tool calls), whose tokens diverge from the raw
-            # generation — so origin+output is not a clean prefix of the next request and
-            # never prefix-matches. origin_input_ids, by contrast, IS a token-exact prefix
-            # of the next turn (chat templates concatenate messages), which is exactly the
-            # unit radix/hicache match on. Its KV sits at the first slots of req_to_token.
-            token_ids = list(req.origin_input_ids)
-            n = (len(token_ids) // self.page_size) * self.page_size
-            if n == 0 or token_indices.numel() < n:
+            # Park the full finished sequence: prompt prefix (origin_input_ids) + the
+            # decode-generated tokens (output_ids). The prefill side indexes it at TWO
+            # matchable boundaries into one stored block:
+            #   - prefix (origin): a token-exact prefix of the next turn (chat templates
+            #     concatenate messages) -> always hits, recovers the prompt KV.
+            #   - full (origin+generated): hits ONLY when the next turn's re-rendered
+            #     assistant tokens equal the raw generation (plain text: yes; tool calls:
+            #     often no, because the template re-serializes the tool call). When it
+            #     hits, the generated KV is reused too, cutting the per-turn recompute of
+            #     the assistant response. output_ids[:-1] = the committed KV range.
+            prompt_ids = list(req.origin_input_ids)
+            gen_ids = list(req.output_ids[:-1]) if self.park_gen else []
+            full_ids = prompt_ids + gen_ids
+            n_full = (len(full_ids) // self.page_size) * self.page_size
+            n_prefix = (len(prompt_ids) // self.page_size) * self.page_size
+            if n_full == 0 or token_indices.numel() < n_full:
                 return False
-            kv_indices = token_indices[:n].detach().to("cpu", torch.int64).tolist()
+            kv_indices = token_indices[:n_full].detach().to("cpu", torch.int64).tolist()
             self._push.send(
                 pickle.dumps(
                     {
                         "type": "park",
                         "rid": req.rid,
-                        "token_ids": token_ids[:n],
+                        "token_ids": full_ids[:n_full],
+                        "prefix_len": n_prefix,
                         "kv_indices": kv_indices,
                     }
                 )
@@ -619,8 +630,11 @@ class IdleKVParkManager:
             self._park_v[layer][start : start + n] = self.peer_v_buffer[layer][s].to(park_dev)
         torch.cuda.synchronize(self.park_gpu)
 
-    def _park_to_gpu(self, token_ids, src_indices, n: int) -> None:
-        """Store the prefix KV in the dedicated idle-GPU pool (ring buffer + LRU index)."""
+    def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0) -> None:
+        """Store the full sequence KV in the dedicated idle-GPU pool (ring buffer + LRU
+        index). Index it at two boundaries into the SAME block: the prompt prefix
+        (prefix_len, always matchable next turn) and the full length (matchable only
+        when the generated tokens recur, i.e. plain-text turns). See park()."""
         if n > PARK_POOL_TOKENS:
             return
         h = hash(tuple(token_ids))
@@ -645,6 +659,15 @@ class IdleKVParkManager:
         ms = (time.perf_counter() - t0) * 1000.0
         self._park_index[h] = (start, n)
         self._park_lens[n] += 1
+        # Also index the prompt-prefix boundary into the SAME block, so a next turn whose
+        # generated tokens diverge (tool calls) still hits the prefix and recovers the
+        # prompt KV (no regression vs prefix-only parking). The prefix is the first
+        # prefix_len slots of this block; the fetch restores whichever length matches.
+        if 0 < prefix_len < n:
+            hp = hash(tuple(token_ids[:prefix_len]))
+            if hp not in self._park_index:
+                self._park_index[hp] = (start, prefix_len)
+                self._park_lens[prefix_len] += 1
         self._park_next = end % PARK_POOL_TOKENS
         self._copied_count += 1
         self._n_sum += n
@@ -782,7 +805,7 @@ class IdleKVParkManager:
 
         # slice 4: park into a dedicated idle-GPU pool that survives P-GPU pressure.
         if self.park_gpu is not None:
-            self._park_to_gpu(token_ids, src_indices, n)
+            self._park_to_gpu(token_ids, src_indices, n, prefix_len=msg.get("prefix_len", n))
             self._maybe_diag()
             return
 
