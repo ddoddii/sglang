@@ -64,6 +64,26 @@ RENDEZVOUS_TIMEOUT_S = 180
 # (slot 0 is the padded dummy); the allocator overwrites them on real use.
 SELFTEST_N_SLOTS = 64
 
+# Rolling polynomial prefix hash (fetch-path optimization). Park stores an entry
+# keyed by the hash of its token_ids at two page-aligned boundaries; fetch must probe
+# the request's prefix at each parked length. Computing hash(tuple(token_ids[:L])) per
+# length allocates an L-int tuple and rehashes L ints *every* length -- O(#lengths x L)
+# on the scheduler main thread, which becomes the bottleneck at high concurrency
+# (saturation: bottleneck moves from GPU-prefill-FLOPs to scheduler-CPU). A polynomial
+# hash h_L = (((tok_0+1)*B + tok_1+1)*B + ...) mod 2^63 lets fetch compute the hash at
+# every boundary in ONE O(n) pass and look each length up in O(1), with no per-length
+# tuple allocation. Both park and fetch use _prefix_hash so the keys agree.
+_PH_B = 1_000_003
+_PH_MASK = (1 << 63) - 1
+
+
+def _prefix_hash(token_ids, upto: int) -> int:
+    """Polynomial hash of token_ids[:upto] (see _PH_B note). O(upto), no allocation."""
+    h = 0
+    for i in range(upto):
+        h = (h * _PH_B + token_ids[i] + 1) & _PH_MASK
+    return h
+
 
 def _export_ipc(tensor: torch.Tensor) -> dict:
     """Export a CUDA tensor as a picklable IPC descriptor (mirrors mm_utils.py)."""
@@ -637,7 +657,7 @@ class IdleKVParkManager:
         when the generated tokens recur, i.e. plain-text turns). See park()."""
         if n > PARK_POOL_TOKENS:
             return
-        h = hash(tuple(token_ids))
+        h = _prefix_hash(token_ids, n)
         if h in self._park_index:
             self._park_index.move_to_end(h)
             self._skipped_count += 1  # already parked
@@ -664,7 +684,7 @@ class IdleKVParkManager:
         # prompt KV (no regression vs prefix-only parking). The prefix is the first
         # prefix_len slots of this block; the fetch restores whichever length matches.
         if 0 < prefix_len < n:
-            hp = hash(tuple(token_ids[:prefix_len]))
+            hp = _prefix_hash(token_ids, prefix_len)
             if hp not in self._park_index:
                 self._park_index[hp] = (start, prefix_len)
                 self._park_lens[prefix_len] += 1
@@ -684,26 +704,43 @@ class IdleKVParkManager:
     # --- slice 4b: fetch-on-hit (pull a parked prefix back before prefill) -------
     def _match_park_prefix(self, token_ids):
         """Longest parked entry whose token_ids is a (page-aligned) prefix of
-        token_ids. Park entries are keyed by hash(their full token_ids); we probe
-        request[:L] for each distinct parked length L (descending) and return the
-        first (longest) hit as (start, n). O(#distinct lengths) hashes per request."""
-        if not self._park_lens:
+        token_ids, returned as (start, n).
+
+        Fetch runs on the saturated scheduler main thread, so this is hot. Instead of
+        rehashing tuple(token_ids[:L]) per parked length L (O(#lengths x L) + a fresh
+        tuple each L), compute the rolling polynomial prefix hash in ONE O(max_L) pass,
+        recording it at each parked-length boundary, then look each length up in O(1).
+        No per-length allocation. ent[1]==L guards the (astronomically rare) collision."""
+        cand = [L for L in self._park_lens if L <= len(token_ids)]
+        if not cand:
             return None
-        n_req = len(token_ids)
-        for L in sorted(self._park_lens, reverse=True):
-            if L > n_req:
-                continue
-            h = hash(tuple(token_ids[:L]))
-            ent = self._park_index.get(h)
-            if ent is not None and ent[1] == L:  # ent[1]==L guards hash collisions
-                self._park_index.move_to_end(h)  # LRU touch on read
+        needed = set(cand)
+        max_L = max(cand)
+        boundary = {}  # parked length L -> polynomial hash of token_ids[:L]
+        h = 0
+        for i in range(max_L):
+            h = (h * _PH_B + token_ids[i] + 1) & _PH_MASK
+            L = i + 1
+            if L in needed:
+                boundary[L] = h
+        for L in sorted(cand, reverse=True):
+            hL = boundary[L]
+            ent = self._park_index.get(hL)
+            if ent is not None and ent[1] == L:
+                self._park_index.move_to_end(hL)  # LRU touch on read
                 return ent
         return None
 
-    def _gather_copy_park_to_local(self, park_start, existing, n, dst_indices) -> None:
+    def _gather_copy_park_to_local(self, park_start, existing, n, dst_idx) -> None:
         """Copy park-pool slots [park_start+existing : park_start+n] (idle GPU) ->
-        local KV-pool dst_indices (P GPU), across all layers. This is the fetch
+        local KV-pool slots dst_idx (P GPU), across all layers. This is the fetch
         direction: park_gpu -> P (PCIe on this topology, NVLink if paired).
+
+        dst_idx is the GPU LongTensor of allocated local slots (a view into the alloc
+        result) -- used directly to index the KV buffers. Earlier this took a Python
+        list and rebuilt a GPU tensor via torch.tensor(...), which forced a synchronous
+        GPU->CPU->GPU round-trip on the scheduler main thread; passing the device tensor
+        removes that host sync (the diagnosed saturation cost).
 
         Async by default: the copy is enqueued on the P-GPU default stream and NOT
         host-synchronized, so the scheduler is not blocked for the copy. Correctness
@@ -711,11 +748,10 @@ class IdleKVParkManager:
         each forward, ordering this copy ahead of any model read of the KV. The park
         source (GPU2) was synchronized at park time, so it is stable to read."""
         local_dev = f"cuda:{self.gpu_id}"
-        d = torch.tensor(dst_indices, dtype=torch.long, device=local_dev)
         lo, hi = park_start + existing, park_start + n
         for layer in range(len(self.k_buffer)):
-            self.k_buffer[layer][d] = self._park_k[layer][lo:hi].to(local_dev)
-            self.v_buffer[layer][d] = self._park_v[layer][lo:hi].to(local_dev)
+            self.k_buffer[layer][dst_idx] = self._park_k[layer][lo:hi].to(local_dev)
+            self.v_buffer[layer][dst_idx] = self._park_v[layer][lo:hi].to(local_dev)
         if self.sync_fetch:
             torch.cuda.synchronize(self.gpu_id)
 
@@ -766,17 +802,18 @@ class IdleKVParkManager:
                 self.token_to_kv_pool_allocator.free(dst)
                 self._fetch_already += 1
                 return 0
-        dst_list = dst.detach().to("cpu", torch.int64).tolist()
+        dst64 = dst.to(torch.int64)  # index/insert dtype; no host sync (stays on GPU)
         inserted_into_tree = False
         try:
             t0 = time.perf_counter()
             # Copy only the tail P lacks; dst[:existing] is freed after insert matches it.
-            self._gather_copy_park_to_local(start, existing, n, dst_list[existing:n])
+            # Pass the GPU slot view directly -- no GPU->CPU->GPU round-trip (see helper).
+            self._gather_copy_park_to_local(start, existing, n, dst64[existing:n])
             ms = (time.perf_counter() - t0) * 1000.0
-            new_prefix_len = self.tree_cache.insert(key, dst.to(torch.int64))
-            inserted_into_tree = True  # tree now owns dst[new_prefix_len:]
+            new_prefix_len = self.tree_cache.insert(key, dst64)
+            inserted_into_tree = True  # tree now owns dst64[new_prefix_len:]
             if new_prefix_len > 0:
-                self.token_to_kv_pool_allocator.free(dst[:new_prefix_len])
+                self.token_to_kv_pool_allocator.free(dst64[:new_prefix_len])
         except Exception:
             if not inserted_into_tree:
                 self.token_to_kv_pool_allocator.free(dst)  # rollback whole alloc
