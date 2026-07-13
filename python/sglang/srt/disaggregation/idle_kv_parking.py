@@ -75,6 +75,13 @@ DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
 PREFILL_ZMQ_FILE = os.path.join(PARK_DIR, "prefill_park_zmq.pkl")
 RENDEZVOUS_TIMEOUT_S = 180
 
+
+def _gpu_usage_file(gpu: int) -> str:
+    """Per-GPU live serving KV-usage telemetry file (Phase 2 slice-2). Each node writes
+    its own GPU's KV pool usage here; the parking node reads candidate GPUs' usage to
+    place a park onto whichever GPU is momentarily idle (pressure-aware placement)."""
+    return os.path.join(PARK_DIR, f"usage_gpu{gpu}.txt")
+
 # slice 2b self-test: number of KV slots to round-trip D->P to validate the
 # multi-layer indexed gather-copy over NVLink. Uses free slots [1..N] at startup
 # (slot 0 is the padded dummy); the allocator overwrites them on real use.
@@ -264,6 +271,11 @@ class IdleKVParkManager:
         # can reuse it when the assistant tokens recur. Set SGLANG_KV_PARK_GEN=0 to park
         # the prefix only (the earlier behavior) for a clean A/B of the generated gain.
         self.park_gen = os.environ.get("SGLANG_KV_PARK_GEN", "1") == "1"
+        # Phase 2 slice-2: place a park onto the candidate GPU with the lowest LIVE
+        # serving KV usage (the momentarily-idle GPU), read from per-GPU telemetry, not
+        # just the park pool's own fill. Falls back to headroom when telemetry is absent
+        # (e.g. dedicated spare GPUs). Set 0 to force slice-1 headroom-only selection.
+        self.pressure_aware = os.environ.get("SGLANG_KV_PARK_PRESSURE_AWARE", "1") == "1"
 
         # slice 4 / Phase 2 slice 1: park pools on one or more idle GPUs. Parking picks,
         # per request, the pool with the most headroom (opportunistic idle-GPU placement).
@@ -280,6 +292,13 @@ class IdleKVParkManager:
         threading.Thread(
             target=self._setup, name="idle-kv-park-setup", daemon=True
         ).start()
+
+        # Phase 2 slice-2: every node publishes its live serving KV usage so the parking
+        # node can pick the momentarily-idle GPU. Runs for all roles (allocator present).
+        if self.k_buffer is not None:
+            threading.Thread(
+                target=self._publish_usage_loop, name="idle-kv-park-usage", daemon=True
+            ).start()
 
     def _setup(self) -> None:
         try:
@@ -683,11 +702,65 @@ class IdleKVParkManager:
             len(self._pools), [p.gpu for p in self._pools], N, len(self.k_buffer), total_gb,
         )
 
+    def _live_kv_usage(self):
+        """This node's live serving KV pool usage fraction [0,1], or None."""
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            total = getattr(alloc, "size", None)
+            if not total:
+                return None
+            return max(0.0, min(1.0, 1.0 - alloc.available_size() / total))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _publish_usage_loop(self) -> None:
+        """Write this GPU's live serving KV usage to its telemetry file every 0.5s."""
+        path = _gpu_usage_file(self.gpu_id)
+        while True:
+            u = self._live_kv_usage()
+            if u is not None:
+                try:
+                    tmp = path + f".tmp.{os.getpid()}"
+                    with open(tmp, "w") as fh:
+                        fh.write(f"{u:.4f} {time.time():.1f}")
+                    os.replace(tmp, path)
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(0.5)
+
+    def _read_gpu_usage(self, gpu: int, stale_s: float = 5.0):
+        """Read GPU `gpu`'s last-published serving KV usage; None if missing/stale.
+        A dedicated spare GPU (no serving process) has no file -> None -> treated as
+        idle (0.0) by the selector, so slice-1 (dedicated spare) behavior is preserved."""
+        try:
+            with open(_gpu_usage_file(gpu)) as fh:
+                parts = fh.read().split()
+            u = float(parts[0])
+            ts = float(parts[1]) if len(parts) > 1 else time.time()
+            if time.time() - ts > stale_s:
+                return None
+            return u
+        except Exception:  # noqa: BLE001
+            return None
+
     def _select_pool(self) -> "_ParkPool":
-        """Pick the target pool for a new park: the one with the most headroom (the most
-        idle GPU right now). Ties/all-full -> the first (stable). This is the
-        opportunistic "store on whichever GPU has room" decision (Phase 2 slice 1)."""
-        return max(self._pools, key=lambda p: p.headroom())
+        """Pick the target pool for a new park.
+
+        Phase 2 slice-2 (pressure-aware): choose the pool on the GPU with the LOWEST live
+        serving KV usage -- i.e. store onto whichever candidate GPU is momentarily idle
+        right now -- tie-broken by park-pool headroom. A GPU with no telemetry (dedicated
+        spare, no serving process) counts as idle (0.0), so this degrades to slice-1
+        headroom-only selection. Set SGLANG_KV_PARK_PRESSURE_AWARE=0 to force slice-1."""
+        if not self.pressure_aware:
+            return max(self._pools, key=lambda p: p.headroom())
+
+        def key(p: "_ParkPool"):
+            u = self._read_gpu_usage(p.gpu)
+            serving = 0.0 if u is None else u  # no telemetry => not serving => idle
+            # low serving usage first; among equally-idle GPUs prefer more headroom.
+            return (round(serving, 2), -p.headroom())
+
+        return min(self._pools, key=key)
 
     def _find_parked(self, h: int):
         """Return (pool, entry) if hash h is parked in any pool, else (None, None)."""
@@ -1002,8 +1075,14 @@ class IdleKVParkManager:
         fetch_attempts = (
             self._fetch_hits + self._fetch_miss + self._fetch_already + self._fetch_nospace
         )
-        # per-pool occupancy: shows how parks spread across the idle GPUs (slice 1).
-        pool_occ = " ".join(f"g{p.gpu}:{p.occupancy()}/{p.N}({len(p.index)})" for p in self._pools)
+        # per-pool occupancy + live serving usage of that GPU (slice 1 fill / slice 2
+        # pressure). "use=?" means no telemetry (dedicated spare) -> treated as idle.
+        def _u(p):
+            u = self._read_gpu_usage(p.gpu)
+            return "?" if u is None else f"{u:.2f}"
+        pool_occ = " ".join(
+            f"g{p.gpu}:{p.occupancy()}/{p.N}({len(p.index)},use={_u(p)})" for p in self._pools
+        )
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
