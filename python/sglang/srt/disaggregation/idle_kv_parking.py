@@ -124,13 +124,19 @@ class _ParkPool:
         self.index = OrderedDict()  # prefix-hash -> (start, n)
         self.lens = Counter()       # distinct parked lengths present (for fetch probe)
         self.next = 0               # ring write pointer
-        self.live = 0               # ~live primary-block tokens (headroom estimate)
+        self.written = 0            # cumulative tokens ever written (monotonic)
         self.gb = 2 * N * head_num * head_dim * k_buffer[0].element_size() * L / 1e9
 
+    def occupancy(self) -> int:
+        """Occupied slots. Once cumulative writes reach N the ring has cycled and every
+        slot holds (LRU) data, so occupancy saturates at N. Monotonic proxy, never
+        drifts (unlike a live counter with dual-index + wrap)."""
+        return min(self.written, self.N)
+
     def headroom(self) -> int:
-        """Approx free token slots. Selection prefers the pool with the most room, i.e.
-        the most idle GPU. Once a pool has cycled its ring this saturates near 0."""
-        return self.N - min(self.live, self.N)
+        """Free token slots. Selection prefers the pool with the most room -- the most
+        idle GPU. A cycled pool reports 0 (about to LRU-evict on the next write)."""
+        return self.N - self.occupancy()
 
 
 def _export_ipc(tensor: torch.Tensor) -> dict:
@@ -724,7 +730,6 @@ class IdleKVParkManager:
             if not (s0 + ln <= start or s0 >= end):
                 del pool.index[k]
                 pool.lens[ln] -= 1
-                pool.live -= ln
                 if pool.lens[ln] <= 0:
                     del pool.lens[ln]
         t0 = time.perf_counter()
@@ -732,7 +737,7 @@ class IdleKVParkManager:
         ms = (time.perf_counter() - t0) * 1000.0
         pool.index[h] = (start, n)
         pool.lens[n] += 1
-        pool.live += n
+        pool.written += n  # monotonic occupancy proxy (headroom-based selection)
         # Also index the prompt-prefix boundary into the SAME block, so a next turn whose
         # generated tokens diverge (tool calls) still hits the prefix and recovers the
         # prompt KV (no regression vs prefix-only parking).
@@ -998,7 +1003,7 @@ class IdleKVParkManager:
             self._fetch_hits + self._fetch_miss + self._fetch_already + self._fetch_nospace
         )
         # per-pool occupancy: shows how parks spread across the idle GPUs (slice 1).
-        pool_occ = " ".join(f"g{p.gpu}:{p.live}/{p.N}({len(p.index)})" for p in self._pools)
+        pool_occ = " ".join(f"g{p.gpu}:{p.occupancy()}/{p.N}({len(p.index)})" for p in self._pools)
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
