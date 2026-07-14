@@ -69,6 +69,9 @@ def _parse_park_gpus():
 PARK_GPUS = _parse_park_gpus()
 PARK_GPU = PARK_GPUS[0] if PARK_GPUS else None  # back-compat alias (primary pool)
 PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "200000"))
+# Session-keyed parking (Phase 2 task 7): free a conversation's superseded (prefix)
+# versions instead of ring-appending them, so a small pool holds the live working set.
+PARK_SESSION_KEYED = os.environ.get("SGLANG_KV_PARK_SESSION_KEYED", "0") == "1"
 # N-node rendezvous (Phase 2 slice-2 piece 2): each node publishes its own file so a
 # 2P2D cluster's 4 nodes don't clobber a single rendezvous file. Decode publishes its
 # KV-pool IPC handles (so any prefill can read its KV to copy a park); prefill publishes
@@ -121,6 +124,45 @@ def _prefix_hash(token_ids, upto: int) -> int:
     return h
 
 
+class _FreeList:
+    """First-fit free-list allocator over [0, N) token slots (session-keyed park mode).
+
+    A pure ring can't reclaim a superseded conversation's space (each turn appends a
+    bigger block), so the ring churns and evicts live entries. The free-list lets a park
+    FREE the old version's region and reuse it, so live data ~= sum of latest-per-session
+    lengths -> a small pool can hold the working set (higher survival, less variance)."""
+
+    def __init__(self, N: int):
+        self.N = N
+        self.gaps = [[0, N]]  # sorted, coalesced [start, len] free regions
+
+    def alloc(self, n: int):
+        for i, g in enumerate(self.gaps):
+            if g[1] >= n:
+                s = g[0]
+                if g[1] == n:
+                    self.gaps.pop(i)
+                else:
+                    g[0] += n
+                    g[1] -= n
+                return s
+        return None  # no single gap big enough (fragmented/full)
+
+    def free(self, s: int, n: int) -> None:
+        self.gaps.append([s, n])
+        self.gaps.sort()
+        merged = []
+        for g in self.gaps:
+            if merged and merged[-1][0] + merged[-1][1] == g[0]:
+                merged[-1][1] += g[1]
+            else:
+                merged.append(list(g))
+        self.gaps = merged
+
+    def free_tokens(self) -> int:
+        return sum(l for _, l in self.gaps)
+
+
 class _ParkPool:
     """One idle GPU's KV park buffer: a ring of N token slots + an LRU index.
 
@@ -143,14 +185,19 @@ class _ParkPool:
         self.v = [torch.zeros(N, head_num, head_dim, dtype=dtype, device=self.dev) for _ in range(L)]
         self.index = OrderedDict()  # prefix-hash -> (start, n)
         self.lens = Counter()       # distinct parked lengths present (for fetch probe)
-        self.next = 0               # ring write pointer
+        self.next = 0               # ring write pointer (ring mode)
         self.written = 0            # cumulative tokens ever written (monotonic)
         self.gb = 2 * N * head_num * head_dim * k_buffer[0].element_size() * L / 1e9
+        # session-keyed mode: free-list allocator + per-region block tracking + LRU.
+        self.session_keyed = PARK_SESSION_KEYED
+        self.freelist = _FreeList(N) if self.session_keyed else None
+        self.blocks = OrderedDict()  # start -> (n, [hashes]); LRU order for eviction
 
     def occupancy(self) -> int:
-        """Occupied slots. Once cumulative writes reach N the ring has cycled and every
-        slot holds (LRU) data, so occupancy saturates at N. Monotonic proxy, never
-        drifts (unlike a live counter with dual-index + wrap)."""
+        """Occupied slots. Session-keyed: N - free_tokens (live regions). Ring: min(
+        cumulative writes, N) -- saturates once the ring cycles."""
+        if self.session_keyed:
+            return self.N - self.freelist.free_tokens()
         return min(self.written, self.N)
 
     def headroom(self) -> int:
@@ -897,6 +944,47 @@ class IdleKVParkManager:
                 return p, ent
         return None, None
 
+    def _free_region(self, pool, start) -> None:
+        """Session-keyed: free the block at `start` -- return its region to the free-list
+        and drop all its index entries (local + shared)."""
+        blk = pool.blocks.pop(start, None)
+        if blk is None:
+            return
+        n_b, hashes = blk
+        for hh in hashes:
+            ent = pool.index.pop(hh, None)
+            if ent is not None:
+                ln = ent[1]
+                pool.lens[ln] -= 1
+                if pool.lens[ln] <= 0:
+                    del pool.lens[ln]
+                if self._shared_index is not None:
+                    self._shared_index.remove(hh)
+        pool.freelist.free(start, n_b)
+
+    def _supersede(self, pool, token_ids, n: int) -> None:
+        """Session-keyed: free any parked block whose tokens are a (page-aligned) prefix
+        of the new sequence -- i.e. older turns of the SAME conversation, now superseded.
+        Links turns by the prefix relation (no client session id needed)."""
+        cand = sorted(L for L in pool.lens if L < n)
+        if not cand:
+            return
+        needed = set(cand)
+        max_L = cand[-1]
+        boundary = {}
+        h = 0
+        for i in range(max_L):
+            h = (h * _PH_B + token_ids[i] + 1) & _PH_MASK
+            if (i + 1) in needed:
+                boundary[i + 1] = h
+        starts = set()
+        for L in cand:
+            ent = pool.index.get(boundary[L])
+            if ent is not None and ent[1] == L:
+                starts.add(ent[0])  # region start of a superseded (prefix) block
+        for s in starts:
+            self._free_region(pool, s)
+
     def _gather_copy_peer_to_park(self, pool, src_k, src_v, src_indices, start: int, n: int) -> None:
         """Copy source decode-pool KV slots -> the given park pool, across all layers.
         src_k/src_v are the IPC-mapped buffers of the decode node that held the sequence."""
@@ -931,39 +1019,56 @@ class IdleKVParkManager:
             self._skipped_count += 1  # already parked (in some pool)
             return
         pool = self._select_pool()  # opportunistic: most-idle GPU
-        start = pool.next
-        if start + n > pool.N:
-            start = 0  # wrap
-        end = start + n
-        # Evict index entries whose slots the new write overlaps (local + shared mirror).
-        for k in list(pool.index.keys()):
-            s0, ln = pool.index[k]
-            if not (s0 + ln <= start or s0 >= end):
-                del pool.index[k]
-                pool.lens[ln] -= 1
-                if pool.lens[ln] <= 0:
-                    del pool.lens[ln]
-                if self._shared_index is not None:
-                    self._shared_index.remove(k)
+        if pool.session_keyed:
+            # Free this conversation's superseded (prefix) versions, then free-list alloc;
+            # evict LRU blocks if fragmented/full. So live data ~= latest-per-session.
+            self._supersede(pool, token_ids, n)
+            start = pool.freelist.alloc(n)
+            while start is None and pool.blocks:
+                self._free_region(pool, next(iter(pool.blocks)))  # evict LRU block
+                self._fetch_evicted += 1
+                start = pool.freelist.alloc(n)
+            if start is None:
+                self._fetch_nospace += 1
+                return
+        else:
+            start = pool.next
+            if start + n > pool.N:
+                start = 0  # wrap
+            end = start + n
+            for k in list(pool.index.keys()):  # ring: evict index entries the write overlaps
+                s0, ln = pool.index[k]
+                if not (s0 + ln <= start or s0 >= end):
+                    del pool.index[k]
+                    pool.lens[ln] -= 1
+                    if pool.lens[ln] <= 0:
+                        del pool.lens[ln]
+                    if self._shared_index is not None:
+                        self._shared_index.remove(k)
         t0 = time.perf_counter()
         self._gather_copy_peer_to_park(pool, src_k, src_v, src_indices, start, n)
         ms = (time.perf_counter() - t0) * 1000.0
+        hashes = [h]
         pool.index[h] = (start, n)
         pool.lens[n] += 1
-        pool.written += n  # monotonic occupancy proxy (headroom-based selection)
+        pool.written += n
         if self._shared_index is not None:
             self._shared_index.insert(h, pool.gpu, start, n)
-        # Also index the prompt-prefix boundary into the SAME block, so a next turn whose
-        # generated tokens diverge (tool calls) still hits the prefix and recovers the
-        # prompt KV (no regression vs prefix-only parking).
+        # Also index the prompt-prefix boundary into the SAME block (no regression vs
+        # prefix-only parking when generated tokens diverge).
         if 0 < prefix_len < n:
             hp = _prefix_hash(token_ids, prefix_len)
             if hp not in pool.index:
                 pool.index[hp] = (start, prefix_len)
                 pool.lens[prefix_len] += 1
+                hashes.append(hp)
                 if self._shared_index is not None:
                     self._shared_index.insert(hp, pool.gpu, start, prefix_len)
-        pool.next = end % pool.N
+        if pool.session_keyed:
+            pool.blocks[start] = (n, hashes)
+            pool.blocks.move_to_end(start)  # MRU
+        else:
+            pool.next = (start + n) % pool.N
         self._copied_count += 1
         self._n_sum += n
         self._recent_parked.append((h, n))  # dense: reflects the next-turn window
