@@ -304,8 +304,22 @@ class IdleKVParkManager:
         self.park_gpus = list(PARK_GPUS)
         self.park_gpu = PARK_GPU  # primary (first) pool; kept for logs/back-compat
         self._pools: List["_ParkPool"] = []
+        # Shared cross-node park index (piece 1/3): mirror of park entries so a different
+        # prefill can discover a park written by this node. Lives in /dev/shm, shared by
+        # all prefills of this run.
+        self._shared_index = None
         if self.role == "prefill" and self.park_gpus and self.k_buffer is not None:
             self._init_park_gpu_pool()
+            try:
+                from sglang.srt.disaggregation.shared_park_index import SharedParkIndex
+
+                self._shared_index = SharedParkIndex(os.path.join(PARK_DIR, "park_index.bin"))
+                logger.info("Idle KV parking [prefill gpu%s]: shared park index attached "
+                            "(%s).", self.gpu_id, os.path.join(PARK_DIR, "park_index.bin"))
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill gpu%s]: shared index init failed: %r; "
+                             "cross-P discovery disabled.", self.gpu_id, e)
+                self._shared_index = None
         from collections import deque as _deque
 
         self._recent_parked = _deque(maxlen=32)  # recent parks for survival probe
@@ -712,11 +726,14 @@ class IdleKVParkManager:
         NOTE (slice 3c): correctness under reuse needs an ack so D holds the slots
         until P has copied; for now the tool-call idle gap keeps them valid at low load.
         """
-        if self.role != "decode" or self._push is None:
+        if self.role != "decode" or not self._push_by_gpu:
             return False
         if getattr(req, "req_pool_idx", -1) == -1:
             return False
         try:
+            target_gpu, sock = self._select_target_prefill()
+            if sock is None:
+                return False
             token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
             # Park the full finished sequence: prompt prefix (origin_input_ids) + the
             # decode-generated tokens (output_ids). The prefill side indexes it at TWO
@@ -736,11 +753,12 @@ class IdleKVParkManager:
             if n_full == 0 or token_indices.numel() < n_full:
                 return False
             kv_indices = token_indices[:n_full].detach().to("cpu", torch.int64).tolist()
-            self._push.send(
+            sock.send(
                 pickle.dumps(
                     {
                         "type": "park",
                         "rid": req.rid,
+                        "src_gpu": self.gpu_id,   # which decode pool the KV lives in
                         "token_ids": full_ids[:n_full],
                         "prefix_len": n_prefix,
                         "kv_indices": kv_indices,
@@ -752,6 +770,23 @@ class IdleKVParkManager:
             logger.error("Idle KV parking [decode]: park failed rid=%s: %r",
                          getattr(req, "rid", "?"), e)
             return False
+
+    def _select_target_prefill(self):
+        """D: pick the prefill node to park onto -- the one with the lowest LIVE serving
+        KV usage (the momentarily-idle P), from per-GPU telemetry. This is where the
+        pressure-aware placement decision happens in NpNd. Falls back to any P when no
+        telemetry. Returns (gpu, socket) or (None, None)."""
+        items = list(self._push_by_gpu.items())
+        if not items:
+            return None, None
+        if self.pressure_aware:
+            def usage(g):
+                u = self._read_gpu_usage(g)
+                return 1.0 if u is None else u  # unknown P -> treat as busy (avoid)
+            g = min((g for g, _ in items), key=usage)
+            return g, self._push_by_gpu[g]
+        g, s = items[0]
+        return g, s
 
     # --- prefill side (slice 3b/3c): drain parked messages on the main thread --
     def poll_incoming(self, max_msgs: int = 4) -> None:
@@ -855,22 +890,33 @@ class IdleKVParkManager:
                 return p, ent
         return None, None
 
-    def _gather_copy_peer_to_park(self, pool: "_ParkPool", src_indices, start: int, n: int) -> None:
-        """Copy peer(D) KV slots -> the given idle-GPU pool, across all layers."""
-        peer_dev = f"cuda:{self.peer_k_buffer[0].device.index}"
+    def _gather_copy_peer_to_park(self, pool, src_k, src_v, src_indices, start: int, n: int) -> None:
+        """Copy source decode-pool KV slots -> the given park pool, across all layers.
+        src_k/src_v are the IPC-mapped buffers of the decode node that held the sequence."""
+        peer_dev = f"cuda:{src_k[0].device.index}"
         s = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
-        for layer in range(len(self.peer_k_buffer)):
-            pool.k[layer][start : start + n] = self.peer_k_buffer[layer][s].to(pool.dev)
-            pool.v[layer][start : start + n] = self.peer_v_buffer[layer][s].to(pool.dev)
+        for layer in range(len(src_k)):
+            pool.k[layer][start : start + n] = src_k[layer][s].to(pool.dev)
+            pool.v[layer][start : start + n] = src_v[layer][s].to(pool.dev)
         torch.cuda.synchronize(pool.gpu)
 
-    def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0) -> None:
-        """Store the full sequence KV in an idle-GPU pool (ring buffer + LRU index),
-        picking the pool with the most headroom. Index it at two boundaries into the
-        SAME block: the prompt prefix (prefix_len, always matchable next turn) and the
-        full length (matchable only when the generated tokens recur). See park()."""
+    def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0,
+                     src_gpu: int = -1) -> None:
+        """Store the full sequence KV (copied from the src_gpu decode pool) in a local
+        park pool (ring buffer + LRU index), and mirror the index entry to the shared
+        cross-node index so a different prefill can discover it. Index at two boundaries:
+        prompt prefix (always matchable next turn) + full length (generated-tokens recur)."""
         if n > PARK_POOL_TOKENS or not self._pools:
             return
+        # Source decode pool this KV lives in (N-node). Fall back to the single-peer
+        # buffer for 1P1D back-compat.
+        src = self.peer_decode_pools.get(src_gpu)
+        if src is None:
+            if self.peer_k_buffer is None:
+                return
+            src_k, src_v = self.peer_k_buffer, self.peer_v_buffer
+        else:
+            src_k, src_v = src
         h = _prefix_hash(token_ids, n)
         found, _ = self._find_parked(h)
         if found is not None:
@@ -882,7 +928,7 @@ class IdleKVParkManager:
         if start + n > pool.N:
             start = 0  # wrap
         end = start + n
-        # Evict index entries whose slots the new write overlaps.
+        # Evict index entries whose slots the new write overlaps (local + shared mirror).
         for k in list(pool.index.keys()):
             s0, ln = pool.index[k]
             if not (s0 + ln <= start or s0 >= end):
@@ -890,12 +936,16 @@ class IdleKVParkManager:
                 pool.lens[ln] -= 1
                 if pool.lens[ln] <= 0:
                     del pool.lens[ln]
+                if self._shared_index is not None:
+                    self._shared_index.remove(k)
         t0 = time.perf_counter()
-        self._gather_copy_peer_to_park(pool, src_indices, start, n)
+        self._gather_copy_peer_to_park(pool, src_k, src_v, src_indices, start, n)
         ms = (time.perf_counter() - t0) * 1000.0
         pool.index[h] = (start, n)
         pool.lens[n] += 1
         pool.written += n  # monotonic occupancy proxy (headroom-based selection)
+        if self._shared_index is not None:
+            self._shared_index.insert(h, pool.gpu, start, n)
         # Also index the prompt-prefix boundary into the SAME block, so a next turn whose
         # generated tokens diverge (tool calls) still hits the prefix and recovers the
         # prompt KV (no regression vs prefix-only parking).
@@ -904,6 +954,8 @@ class IdleKVParkManager:
             if hp not in pool.index:
                 pool.index[hp] = (start, prefix_len)
                 pool.lens[prefix_len] += 1
+                if self._shared_index is not None:
+                    self._shared_index.insert(hp, pool.gpu, start, prefix_len)
         pool.next = end % pool.N
         self._copied_count += 1
         self._n_sum += n
@@ -1062,7 +1114,8 @@ class IdleKVParkManager:
 
         # slice 4: park into an idle-GPU pool that survives P-GPU pressure.
         if self._pools:
-            self._park_to_gpu(token_ids, src_indices, n, prefix_len=msg.get("prefix_len", n))
+            self._park_to_gpu(token_ids, src_indices, n, prefix_len=msg.get("prefix_len", n),
+                              src_gpu=msg.get("src_gpu", -1))
             self._maybe_diag()
             return
 
