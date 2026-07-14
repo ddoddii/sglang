@@ -69,9 +69,12 @@ def _parse_park_gpus():
 PARK_GPUS = _parse_park_gpus()
 PARK_GPU = PARK_GPUS[0] if PARK_GPUS else None  # back-compat alias (primary pool)
 PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "200000"))
-# Session-keyed parking (Phase 2 task 7): free a conversation's superseded (prefix)
-# versions instead of ring-appending them, so a small pool holds the live working set.
+# Session-keyed parking (Phase 2 task 7): each conversation gets one fixed-size SLAB it
+# overwrites/grows in place (found via prefix-supersession), so a small pool holds the
+# live working set with NO fragmentation (the variable free-list fragmented). A park is
+# skipped if it exceeds one slab. pool = (N // slab) slabs.
 PARK_SESSION_KEYED = os.environ.get("SGLANG_KV_PARK_SESSION_KEYED", "0") == "1"
+PARK_SLAB_TOKENS = int(os.environ.get("SGLANG_KV_PARK_SLAB_TOKENS", "6000"))
 # N-node rendezvous (Phase 2 slice-2 piece 2): each node publishes its own file so a
 # 2P2D cluster's 4 nodes don't clobber a single rendezvous file. Decode publishes its
 # KV-pool IPC handles (so any prefill can read its KV to copy a park); prefill publishes
@@ -188,16 +191,28 @@ class _ParkPool:
         self.next = 0               # ring write pointer (ring mode)
         self.written = 0            # cumulative tokens ever written (monotonic)
         self.gb = 2 * N * head_num * head_dim * k_buffer[0].element_size() * L / 1e9
-        # session-keyed mode: free-list allocator + per-region block tracking + LRU.
+        # session-keyed mode: fixed-size SLAB allocator (no fragmentation). Each session
+        # owns one slab, overwritten/grown in place (found via prefix-supersession).
         self.session_keyed = PARK_SESSION_KEYED
-        self.freelist = _FreeList(N) if self.session_keyed else None
-        self.blocks = OrderedDict()  # start -> (n, [hashes]); LRU order for eviction
+        self.slab = PARK_SLAB_TOKENS
+        self.n_slabs = max(1, N // self.slab) if self.session_keyed else 0
+        self.free_slabs = list(range(self.n_slabs))  # free slab indices
+        self.blocks = OrderedDict()  # slab_base -> (n, [hashes]); LRU order for eviction
+
+    def slab_alloc(self):
+        """Return a free slab's base offset, or None if all slabs are in use."""
+        if not self.free_slabs:
+            return None
+        return self.free_slabs.pop(0) * self.slab
+
+    def slab_release(self, base: int) -> None:
+        self.free_slabs.append(base // self.slab)
 
     def occupancy(self) -> int:
-        """Occupied slots. Session-keyed: N - free_tokens (live regions). Ring: min(
-        cumulative writes, N) -- saturates once the ring cycles."""
+        """Occupied slots. Session-keyed: used slabs x slab size. Ring: min(cumulative
+        writes, N) -- saturates once the ring cycles."""
         if self.session_keyed:
-            return self.N - self.freelist.free_tokens()
+            return (self.n_slabs - len(self.free_slabs)) * self.slab
         return min(self.written, self.N)
 
     def headroom(self) -> int:
@@ -944,13 +959,13 @@ class IdleKVParkManager:
                 return p, ent
         return None, None
 
-    def _free_region(self, pool, start) -> None:
-        """Session-keyed: free the block at `start` -- return its region to the free-list
-        and drop all its index entries (local + shared)."""
-        blk = pool.blocks.pop(start, None)
+    def _clear_slab_index(self, pool, base) -> None:
+        """Drop the index entries of the block currently in slab `base` (local + shared),
+        without releasing the slab. Used before overwriting a session's slab in place."""
+        blk = pool.blocks.pop(base, None)
         if blk is None:
             return
-        n_b, hashes = blk
+        _n_b, hashes = blk
         for hh in hashes:
             ent = pool.index.pop(hh, None)
             if ent is not None:
@@ -960,30 +975,36 @@ class IdleKVParkManager:
                     del pool.lens[ln]
                 if self._shared_index is not None:
                     self._shared_index.remove(hh)
-        pool.freelist.free(start, n_b)
 
-    def _supersede(self, pool, token_ids, n: int) -> None:
-        """Session-keyed: free any parked block whose tokens are a (page-aligned) prefix
-        of the new sequence -- i.e. older turns of the SAME conversation, now superseded.
-        Links turns by the prefix relation (no client session id needed)."""
-        cand = sorted(L for L in pool.lens if L < n)
-        if not cand:
+    def _evict_slab(self, pool) -> None:
+        """Evict the LRU slab: clear its index and return the slab to the free list."""
+        if not pool.blocks:
             return
+        base = next(iter(pool.blocks))  # oldest (LRU)
+        self._clear_slab_index(pool, base)
+        pool.slab_release(base)
+
+    def _supersede_slab(self, pool, token_ids, n: int):
+        """Return the slab base of this conversation's current version (a parked block
+        whose tokens are a page-aligned prefix of the new sequence), to overwrite in
+        place; None if this is a new conversation. Links turns by the prefix relation
+        (no client session id needed) -- so a session reuses ONE slab across turns."""
+        cand = sorted((L for L in pool.lens if L < n), reverse=True)
+        if not cand:
+            return None
         needed = set(cand)
-        max_L = cand[-1]
+        max_L = cand[0]
         boundary = {}
         h = 0
         for i in range(max_L):
             h = (h * _PH_B + token_ids[i] + 1) & _PH_MASK
             if (i + 1) in needed:
                 boundary[i + 1] = h
-        starts = set()
-        for L in cand:
+        for L in cand:  # longest prefix first = this conversation's latest parked version
             ent = pool.index.get(boundary[L])
             if ent is not None and ent[1] == L:
-                starts.add(ent[0])  # region start of a superseded (prefix) block
-        for s in starts:
-            self._free_region(pool, s)
+                return ent[0]  # slab base to overwrite
+        return None
 
     def _gather_copy_peer_to_park(self, pool, src_k, src_v, src_indices, start: int, n: int) -> None:
         """Copy source decode-pool KV slots -> the given park pool, across all layers.
@@ -1020,17 +1041,23 @@ class IdleKVParkManager:
             return
         pool = self._select_pool()  # opportunistic: most-idle GPU
         if pool.session_keyed:
-            # Free this conversation's superseded (prefix) versions, then free-list alloc;
-            # evict LRU blocks if fragmented/full. So live data ~= latest-per-session.
-            self._supersede(pool, token_ids, n)
-            start = pool.freelist.alloc(n)
-            while start is None and pool.blocks:
-                self._free_region(pool, next(iter(pool.blocks)))  # evict LRU block
-                self._fetch_evicted += 1
-                start = pool.freelist.alloc(n)
-            if start is None:
-                self._fetch_nospace += 1
+            # This conversation reuses its own slab (found by prefix-supersession),
+            # overwritten in place; a new conversation takes a free slab (evict LRU if
+            # none). Fixed-size slabs => no fragmentation. Too-big-for-a-slab => skip.
+            if n > pool.slab:
                 return
+            start = self._supersede_slab(pool, token_ids, n)  # own slab, or None (new)
+            if start is not None:
+                self._clear_slab_index(pool, start)  # drop old version's index; keep slab
+            else:
+                start = pool.slab_alloc()
+                while start is None and pool.blocks:
+                    self._evict_slab(pool)
+                    self._fetch_evicted += 1
+                    start = pool.slab_alloc()
+                if start is None:
+                    self._fetch_nospace += 1
+                    return
         else:
             start = pool.next
             if start + n > pool.N:
