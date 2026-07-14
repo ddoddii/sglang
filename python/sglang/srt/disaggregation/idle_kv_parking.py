@@ -69,10 +69,23 @@ def _parse_park_gpus():
 PARK_GPUS = _parse_park_gpus()
 PARK_GPU = PARK_GPUS[0] if PARK_GPUS else None  # back-compat alias (primary pool)
 PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "200000"))
-# Decode publishes its KV-pool IPC handles here; prefill consumes them.
-DECODE_IPC_FILE = os.path.join(PARK_DIR, "decode_kvpool_ipc.pkl")
-# Prefill publishes its ZMQ park-control PULL address here; decode connects a PUSH.
-PREFILL_ZMQ_FILE = os.path.join(PARK_DIR, "prefill_park_zmq.pkl")
+# N-node rendezvous (Phase 2 slice-2 piece 2): each node publishes its own file so a
+# 2P2D cluster's 4 nodes don't clobber a single rendezvous file. Decode publishes its
+# KV-pool IPC handles (so any prefill can read its KV to copy a park); prefill publishes
+# its ZMQ park-control address + its park-pool IPC handles (so peer prefills can read for
+# cross-P fetch). Peers are discovered by scanning PARK_DIR.
+def _decode_ipc_file(gpu: int) -> str:
+    return os.path.join(PARK_DIR, f"decode_{gpu}_ipc.pkl")
+
+
+def _prefill_file(gpu: int) -> str:
+    return os.path.join(PARK_DIR, f"prefill_{gpu}.pkl")
+
+
+# All nodes of ONE run share this epoch (set by the start script). Peer files with a
+# different (or missing, when we set one) epoch are from another run and ignored. The
+# start script also wipes PARK_DIR, so normally only this run's files are present.
+PARK_EPOCH = os.environ.get("SGLANG_KV_PARK_EPOCH", "")
 RENDEZVOUS_TIMEOUT_S = 180
 
 
@@ -217,6 +230,15 @@ class IdleKVParkManager:
         self.peer_k_buffer: Optional[List[torch.Tensor]] = None
         self.peer_v_buffer: Optional[List[torch.Tensor]] = None
         self.peer_ready = threading.Event()
+        # N-node rendezvous (piece 2). prefill side:
+        #   peer_decode_pools[d_gpu] = (k_bufs, v_bufs)  -> read D's KV to copy a park
+        #   peer_park_pools[p_gpu]   = (k_bufs, v_bufs)  -> read a peer P's park pool (cross-P fetch)
+        # decode side:
+        #   _push_by_gpu[p_gpu] = zmq PUSH socket        -> send a park msg to any prefill
+        self.peer_decode_pools = {}
+        self.peer_park_pools = {}
+        self._push_by_gpu = {}
+        self._rdv_lock = threading.Lock()  # guards the discovery dicts (recv/main threads)
 
         os.makedirs(PARK_DIR, exist_ok=True)
         logger.info(
@@ -306,8 +328,8 @@ class IdleKVParkManager:
                 self._decode_publish_ipc()   # 2a: publish KV-pool IPC handles
                 self._decode_connect_zmq()   # 3a: connect to prefill's park channel
             else:
-                self._prefill_setup_zmq()    # 3a: bind park channel + start receiver
-                self._prefill_consume_ipc()  # 2a/2b: open D's IPC, verify
+                self._prefill_setup_zmq()    # 3a: bind park channel + publish handles
+                self._prefill_open_peers()   # piece 2: open all D pools + peer P park pools
         except Exception as e:  # noqa: BLE001
             logger.error("Idle KV parking setup failed (role=%s): %r", self.role, e)
 
@@ -344,22 +366,20 @@ class IdleKVParkManager:
             "st_v_handles": [_export_ipc(t) for t in st_v],
             "ts": time.time(),
         }
+        payload["epoch"] = PARK_EPOCH
         # Keep verify alive for the peer's lifetime.
         self._verify_keepalive = verify
 
-        tmp = DECODE_IPC_FILE + f".tmp.{os.getpid()}"
+        path = _decode_ipc_file(self.gpu_id)
+        tmp = path + f".tmp.{os.getpid()}"
         with open(tmp, "wb") as f:
             pickle.dump(payload, f)
-        os.replace(tmp, DECODE_IPC_FILE)  # atomic publish
+        os.replace(tmp, path)  # atomic publish
         logger.info(
-            "Idle KV parking [decode]: published %d k + %d v IPC handles + verify "
-            "(checksum=%.1f) + selftest(%d slots, checksum=%.1f) to %s",
-            len(self.k_buffer),
-            len(self.v_buffer),
-            verify_checksum,
-            len(st_indices),
-            st_checksum,
-            DECODE_IPC_FILE,
+            "Idle KV parking [decode gpu%s]: published %d k + %d v IPC handles + verify "
+            "(checksum=%.1f) to %s (epoch=%s)",
+            self.gpu_id, len(self.k_buffer), len(self.v_buffer),
+            verify_checksum, path, PARK_EPOCH or "-",
         )
 
     def _build_selftest_buffers(self, indices):
@@ -451,75 +471,105 @@ class IdleKVParkManager:
             else "WARNING: gather-copy mismatch; investigate.",
         )
 
-    def _prefill_consume_ipc(self) -> None:
-        """P: open D's handles, verify NVLink P2P read, keep KV-pool mapping for 2b."""
+    def _load_fresh(self, path: str):
+        """Load a rendezvous pickle; return its payload iff it belongs to this run
+        (matching epoch when one is set), else None."""
+        try:
+            with open(path, "rb") as f:
+                cand = pickle.load(f)
+        except Exception:  # noqa: BLE001 (missing / partial write)
+            return None
+        if PARK_EPOCH and cand.get("epoch", "") != PARK_EPOCH:
+            return None
+        if not PARK_EPOCH and cand.get("ts", 0) < self._setup_start_ts - 300:
+            return None  # heuristic staleness guard when no epoch is configured
+        return cand
+
+    def _discover(self, kind: str):
+        """Yield (gpu, payload) for every fresh peer file of `kind` in PARK_DIR.
+        kind='decode' -> decode_<gpu>_ipc.pkl; kind='prefill' -> prefill_<gpu>.pkl."""
+        import glob
+
+        pat = "decode_*_ipc.pkl" if kind == "decode" else "prefill_*.pkl"
+        for path in glob.glob(os.path.join(PARK_DIR, pat)):
+            payload = self._load_fresh(path)
+            if payload is not None and "gpu_id" in payload:
+                yield payload["gpu_id"], payload
+
+    def _prefill_open_peers(self) -> None:
+        """P: discover and open (a) every decode node's KV pool (to copy a park from
+        whichever D held the sequence) and (b) every PEER prefill's park pool (to fetch a
+        park written by another P). Initial blocking wait, then background rediscovery."""
         torch.cuda.set_device(self.gpu_id)
         deadline = time.time() + RENDEZVOUS_TIMEOUT_S
-        # Wait for a FRESH decode IPC file (ts >= our start). Skip/stale files left by
-        # a prior run would open dead GPU handles (CUDA invalid resource handle).
-        payload = None
-        while True:
-            if os.path.exists(DECODE_IPC_FILE):
-                try:
-                    with open(DECODE_IPC_FILE, "rb") as f:
-                        cand = pickle.load(f)
-                except Exception:  # noqa: BLE001 (partial write / race) -> retry
-                    cand = None
-                if cand is not None and cand.get("ts", 0) >= self._setup_start_ts:
-                    payload = cand
-                    break
+        while not self.peer_decode_pools:
+            self._rediscover_peers(verify_first=True)
+            if self.peer_decode_pools:
+                break
             if time.time() > deadline:
                 logger.warning(
-                    "Idle KV parking [prefill]: no FRESH decode IPC file at %s after "
-                    "%ds (stale-only or peer down). Parking inactive.",
-                    DECODE_IPC_FILE,
-                    RENDEZVOUS_TIMEOUT_S,
+                    "Idle KV parking [prefill gpu%s]: no decode peers discovered after "
+                    "%ds. Parking inactive.", self.gpu_id, RENDEZVOUS_TIMEOUT_S,
                 )
                 return
             time.sleep(1.0)
+        self.peer_ready.set()
+        threading.Thread(
+            target=self._rediscover_loop, name="idle-kv-park-rdv", daemon=True
+        ).start()
 
-        peer_gpu = payload["gpu_id"]
-        can_p2p = torch.cuda.can_device_access_peer(self.gpu_id, peer_gpu)
-
-        # 1) Verify correctness over IPC + P2P using the dedicated verify tensor.
-        verify_peer = _open_ipc(payload["verify"])
-        local = torch.empty_like(verify_peer, device=f"cuda:{self.gpu_id}")
-        local.copy_(verify_peer)  # D_gpu -> P_gpu, P2P/NVLink
-        torch.cuda.synchronize(self.gpu_id)
-        got = float(local.double().sum().item())
-        want = payload["verify_checksum"]
-        ok = abs(got - want) < 1.0
-
-        # 2) Time a real KV-sized P2P read from D's pool (bandwidth in situ).
-        self.peer_k_buffer = [_open_ipc(h) for h in payload["k_handles"]]
-        self.peer_v_buffer = [_open_ipc(h) for h in payload["v_handles"]]
-        bw_gbps = self._bench_kv_read()
-
-        if ok:
-            self.peer_ready.set()
-        logger.info(
-            "Idle KV parking [prefill]: opened peer KV pool (gpu%s<-gpu%s, p2p=%s, "
-            "%d layers). Verify checksum %s (got=%.1f want=%.1f). KV P2P read ~%.1f GB/s. "
-            "%s",
-            self.gpu_id,
-            peer_gpu,
-            can_p2p,
-            len(self.peer_k_buffer),
-            "MATCH" if ok else "MISMATCH",
-            got,
-            want,
-            bw_gbps,
-            "NVLink cross-process IPC verified -> ready for 2b."
-            if (ok and can_p2p)
-            else "WARNING: verification/p2p not clean; investigate.",
-        )
-
-        # slice 2b: validate the real multi-layer indexed gather-copy from D's pool.
-        if ok and can_p2p:
+    def _rediscover_peers(self, verify_first: bool = False) -> None:
+        """Open any not-yet-opened decode KV pools + peer prefill park pools."""
+        for d_gpu, payload in self._discover("decode"):
+            if d_gpu in self.peer_decode_pools:
+                continue
             try:
-                self._run_2b_selftest(payload)
+                k = [_open_ipc(h) for h in payload["k_handles"]]
+                v = [_open_ipc(h) for h in payload["v_handles"]]
             except Exception as e:  # noqa: BLE001
-                logger.error("Idle KV parking [prefill] 2b selftest failed: %r", e)
+                logger.error("Idle KV parking [prefill gpu%s]: open decode gpu%s failed: %r",
+                             self.gpu_id, d_gpu, e)
+                continue
+            with self._rdv_lock:
+                self.peer_decode_pools[d_gpu] = (k, v)
+                if self.peer_k_buffer is None:  # back-compat: 1P1D _receive_park path
+                    self.peer_k_buffer, self.peer_v_buffer = k, v
+            can_p2p = torch.cuda.can_device_access_peer(self.gpu_id, d_gpu)
+            logger.info("Idle KV parking [prefill gpu%s]: opened decode gpu%s KV pool "
+                        "(%d layers, p2p=%s).", self.gpu_id, d_gpu, len(k), can_p2p)
+            if verify_first and "verify" in payload:
+                try:
+                    vp = _open_ipc(payload["verify"])
+                    loc = torch.empty_like(vp, device=f"cuda:{self.gpu_id}")
+                    loc.copy_(vp); torch.cuda.synchronize(self.gpu_id)
+                    ok = abs(float(loc.double().sum().item()) - payload["verify_checksum"]) < 1.0
+                    logger.info("Idle KV parking [prefill gpu%s]: decode gpu%s IPC verify %s.",
+                                self.gpu_id, d_gpu, "MATCH" if ok else "MISMATCH")
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Idle KV parking [prefill gpu%s]: verify failed: %r", self.gpu_id, e)
+        for p_gpu, payload in self._discover("prefill"):
+            if p_gpu == self.gpu_id or p_gpu in self.peer_park_pools:
+                continue
+            for ph in payload.get("park_pools", []):
+                try:
+                    k = [_open_ipc(h) for h in ph["k_handles"]]
+                    v = [_open_ipc(h) for h in ph["v_handles"]]
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Idle KV parking [prefill gpu%s]: open peer park gpu%s failed: %r",
+                                 self.gpu_id, ph.get("gpu"), e)
+                    continue
+                with self._rdv_lock:
+                    self.peer_park_pools[ph["gpu"]] = (k, v)
+                logger.info("Idle KV parking [prefill gpu%s]: opened peer P park pool on "
+                            "gpu%s (%d layers) for cross-P fetch.", self.gpu_id, ph["gpu"], len(k))
+
+    def _rediscover_loop(self) -> None:
+        for _ in range(60):  # ~5 min of late-joiner polling, then stop
+            time.sleep(5.0)
+            try:
+                self._rediscover_peers()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Idle KV parking [prefill gpu%s]: rediscover: %r", self.gpu_id, e)
 
     def _bench_kv_read(self, iters: int = 20) -> float:
         """Copy one layer's k_buffer from the peer pool to a local buffer, timed."""
@@ -540,24 +590,37 @@ class IdleKVParkManager:
             logger.warning("Idle KV parking [prefill]: KV read bench failed: %r", e)
             return -1.0
 
-    # --- slice 3a: ZMQ park control channel (D pushes park messages to P) -------
+    # --- slice 3a / piece 2: ZMQ park control channel + park-pool handle publish ----
     def _prefill_setup_zmq(self) -> None:
-        """P: bind a PULL socket, publish its address, and start the receiver loop."""
+        """P: bind a PULL socket and publish {addr, gpu, park-pool IPC handles} so decode
+        nodes can send park msgs here and peer prefills can read this P's park pool."""
         self._zmq_ctx = zmq.Context(1)
         port, self._pull = get_zmq_socket(self._zmq_ctx, zmq.PULL, endpoint=None)
         addr = f"tcp://127.0.0.1:{port}"
-        tmp = PREFILL_ZMQ_FILE + f".tmp.{os.getpid()}"
+        # Export this prefill's park pools so peer prefills can open them for cross-P fetch.
+        park_handles = []
+        for p in self._pools:
+            park_handles.append({
+                "gpu": p.gpu, "N": p.N,
+                "k_handles": [_export_ipc(t) for t in p.k],
+                "v_handles": [_export_ipc(t) for t in p.v],
+            })
+        payload = {
+            "role": "prefill", "gpu_id": self.gpu_id, "addr": addr,
+            "park_pools": park_handles, "epoch": PARK_EPOCH, "ts": time.time(),
+        }
+        path = _prefill_file(self.gpu_id)
+        tmp = path + f".tmp.{os.getpid()}"
         with open(tmp, "wb") as f:
-            pickle.dump({"addr": addr, "gpu_id": self.gpu_id, "ts": time.time()}, f)
-        os.replace(tmp, PREFILL_ZMQ_FILE)
+            pickle.dump(payload, f)
+        os.replace(tmp, path)
         threading.Thread(
             target=self._prefill_recv_loop, name="idle-kv-park-recv", daemon=True
         ).start()
         logger.info(
-            "Idle KV parking [prefill]: park control channel PULL bound at %s "
-            "(published to %s)",
-            addr,
-            PREFILL_ZMQ_FILE,
+            "Idle KV parking [prefill gpu%s]: PULL bound at %s, published %d park-pool "
+            "handle set(s) to %s (epoch=%s)",
+            self.gpu_id, addr, len(park_handles), path, PARK_EPOCH or "-",
         )
 
     def _prefill_recv_loop(self) -> None:
@@ -590,33 +653,55 @@ class IdleKVParkManager:
             logger.warning("Idle KV parking [prefill]: unknown msg type %r", mtype)
 
     def _decode_connect_zmq(self) -> None:
-        """D: read prefill's PULL address, connect a PUSH, and send a test ping."""
+        """D: discover every prefill node, connect a PUSH to each, send a test ping.
+        Keeps rediscovering so a late-starting prefill is picked up too."""
+        self._zmq_ctx = zmq.Context(1)
         deadline = time.time() + RENDEZVOUS_TIMEOUT_S
-        while not os.path.exists(PREFILL_ZMQ_FILE):
+        while not self._push_by_gpu:
+            self._connect_prefills()
+            if self._push_by_gpu:
+                break
             if time.time() > deadline:
                 logger.warning(
-                    "Idle KV parking [decode]: no prefill ZMQ file at %s after %ds; "
-                    "park control channel inactive.",
-                    PREFILL_ZMQ_FILE,
-                    RENDEZVOUS_TIMEOUT_S,
+                    "Idle KV parking [decode gpu%s]: no prefill nodes discovered after "
+                    "%ds; parking inactive.", self.gpu_id, RENDEZVOUS_TIMEOUT_S,
                 )
                 return
             time.sleep(1.0)
-        with open(PREFILL_ZMQ_FILE, "rb") as f:
-            info = pickle.load(f)
-        addr = info["addr"]
-        self._zmq_ctx = zmq.Context(1)
-        self._push = get_zmq_socket(self._zmq_ctx, zmq.PUSH, endpoint=addr, bind=False)
-        self._push.send(
-            pickle.dumps(
-                {"type": "ping", "from": "decode", "gpu_id": self.gpu_id, "ts": time.time()}
-            )
-        )
-        logger.info(
-            "Idle KV parking [decode]: park control channel PUSH connected to %s, "
-            "sent ping.",
-            addr,
-        )
+        threading.Thread(
+            target=self._decode_rediscover_loop, name="idle-kv-park-rdv", daemon=True
+        ).start()
+
+    def _connect_prefills(self) -> None:
+        for p_gpu, payload in self._discover("prefill"):
+            if p_gpu in self._push_by_gpu:
+                continue
+            addr = payload.get("addr")
+            if not addr:
+                continue
+            try:
+                sock = get_zmq_socket(self._zmq_ctx, zmq.PUSH, endpoint=addr, bind=False)
+                sock.send(pickle.dumps(
+                    {"type": "ping", "from": "decode", "gpu_id": self.gpu_id, "ts": time.time()}))
+            except Exception as e:  # noqa: BLE001
+                logger.error("Idle KV parking [decode gpu%s]: connect prefill gpu%s (%s) "
+                             "failed: %r", self.gpu_id, p_gpu, addr, e)
+                continue
+            with self._rdv_lock:
+                self._push_by_gpu[p_gpu] = sock
+            # back-compat: 1P1D park() uses self._push if set.
+            if self._push is None:
+                self._push = sock
+            logger.info("Idle KV parking [decode gpu%s]: PUSH connected to prefill gpu%s "
+                        "at %s.", self.gpu_id, p_gpu, addr)
+
+    def _decode_rediscover_loop(self) -> None:
+        for _ in range(60):
+            time.sleep(5.0)
+            try:
+                self._connect_prefills()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Idle KV parking [decode gpu%s]: rediscover: %r", self.gpu_id, e)
 
     # --- decode side (slice 3b): park a finished request -----------------------
     def park(self, req: "Req") -> bool:
