@@ -277,6 +277,7 @@ class IdleKVParkManager:
         self._received_msgs = 0  # park messages enqueued by the recv thread
         # slice 4b: fetch-on-hit (prefill pulls a parked prefix back before prefill).
         self._fetch_hits = 0        # requests whose parked prefix was fetched into radix
+        self._fetch_cross_hits = 0  # of those, fetched from a PEER prefill's park pool
         self._fetched_tokens = 0    # tokens copied park-GPU -> local + inserted
         self._fetch_miss = 0        # request had no parked prefix
         self._fetch_already = 0     # P already had the prefix (natural radix hit)
@@ -334,6 +335,12 @@ class IdleKVParkManager:
         if self.k_buffer is not None:
             threading.Thread(
                 target=self._publish_usage_loop, name="idle-kv-park-usage", daemon=True
+            ).start()
+        # piece 4: each prefill publishes its distinct parked lengths so peer prefills
+        # know which lengths to probe in the shared index for cross-P fetch.
+        if self.role == "prefill" and self._pools:
+            threading.Thread(
+                target=self._publish_lengths_loop, name="idle-kv-park-lengths", daemon=True
             ).start()
 
     def _setup(self) -> None:
@@ -970,24 +977,60 @@ class IdleKVParkManager:
                 ", ".join(f"g{p.gpu}:hr={p.headroom()}" for p in self._pools),
             )
 
-    # --- slice 4b: fetch-on-hit (pull a parked prefix back before prefill) -------
-    def _match_park_prefix(self, token_ids):
-        """Longest parked entry (across all idle-GPU pools) whose token_ids is a
-        (page-aligned) prefix of token_ids, returned as (pool, start, n).
+    # --- slice 4b / piece 4: fetch-on-hit across local + peer prefill park pools ----
+    def _peer_park_lengths(self):
+        """Union of parked lengths published by PEER prefills (lengths_<gpu>.txt), so the
+        cross-node probe knows which prefix lengths to test in the shared index."""
+        import glob
 
-        Compute the rolling polynomial prefix hash in ONE O(max_L) pass over the union
-        of parked lengths, recording it at each boundary, then look each length up in
-        O(1) per pool. ent[1]==L guards the (astronomically rare) collision."""
+        out = set()
+        for path in glob.glob(os.path.join(PARK_DIR, "lengths_*.txt")):
+            try:
+                base = os.path.basename(path)
+                gpu = int(base[len("lengths_"):-len(".txt")])
+            except ValueError:
+                continue
+            if gpu == self.gpu_id:
+                continue
+            try:
+                with open(path) as fh:
+                    out.update(int(x) for x in fh.read().split() if x)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _publish_lengths_loop(self) -> None:
+        """Publish this prefill's distinct parked lengths every 0.5s for peer fetchers."""
+        path = os.path.join(PARK_DIR, f"lengths_{self.gpu_id}.txt")
+        while True:
+            lens = set()
+            for p in self._pools:
+                lens.update(p.lens.keys())
+            try:
+                tmp = path + f".tmp.{os.getpid()}"
+                with open(tmp, "w") as fh:
+                    fh.write(" ".join(str(L) for L in sorted(lens)))
+                os.replace(tmp, path)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
+
+    def _find_fetch_source(self, token_ids):
+        """Longest parked prefix of token_ids across LOCAL pools and (via the shared
+        index) PEER prefill park pools. Returns (src_k, src_v, start, n, gpu) or None.
+        One rolling-hash pass over the union of candidate parked lengths (local + peer)."""
         if not self._pools:
             return None
-        union_lens = set()
         n_req = len(token_ids)
+        union_lens = set()
         for p in self._pools:
             union_lens.update(L for L in p.lens if L <= n_req)
+        if self._shared_index is not None:
+            union_lens.update(L for L in self._peer_park_lengths() if L <= n_req)
         if not union_lens:
             return None
         max_L = max(union_lens)
-        boundary = {}  # length L -> polynomial hash of token_ids[:L]
+        boundary = {}
         h = 0
         for i in range(max_L):
             h = (h * _PH_B + token_ids[i] + 1) & _PH_MASK
@@ -996,34 +1039,31 @@ class IdleKVParkManager:
                 boundary[L] = h
         for L in sorted(union_lens, reverse=True):
             hL = boundary[L]
-            for p in self._pools:
+            for p in self._pools:  # local pools first (fast path)
                 ent = p.index.get(hL)
                 if ent is not None and ent[1] == L:
                     p.index.move_to_end(hL)  # LRU touch on read
-                    return p, ent[0], ent[1]
+                    return p.k, p.v, ent[0], ent[1], p.gpu
+            if self._shared_index is not None:  # then peer pools via shared index
+                got = self._shared_index.lookup(hL)
+                if got is not None:
+                    gpu, start, n = got
+                    if n == L and gpu in self.peer_park_pools:
+                        k, v = self.peer_park_pools[gpu]
+                        return k, v, start, n, gpu
         return None
 
-    def _gather_copy_park_to_local(self, pool, park_start, existing, n, dst_idx) -> None:
-        """Copy park-pool slots [park_start+existing : park_start+n] (idle GPU) ->
-        local KV-pool slots dst_idx (P GPU), across all layers. This is the fetch
-        direction: park_gpu -> P (PCIe on this topology, NVLink if paired).
-
-        dst_idx is the GPU LongTensor of allocated local slots (a view into the alloc
-        result) -- used directly to index the KV buffers. Earlier this took a Python
-        list and rebuilt a GPU tensor via torch.tensor(...), which forced a synchronous
-        GPU->CPU->GPU round-trip on the scheduler main thread; passing the device tensor
-        removes that host sync (the diagnosed saturation cost).
-
-        Async by default: the copy is enqueued on the P-GPU default stream and NOT
-        host-synchronized, so the scheduler is not blocked for the copy. Correctness
-        holds because SGLang runs forward_stream.wait_stream(default_stream) before
-        each forward, ordering this copy ahead of any model read of the KV. The park
-        source (GPU2) was synchronized at park time, so it is stable to read."""
+    def _gather_copy_park_to_local(self, src_k, src_v, park_start, existing, n, dst_idx) -> None:
+        """Copy park-pool slots [park_start+existing : park_start+n] (a local OR peer
+        prefill's park pool) -> local KV-pool slots dst_idx (this P's GPU), all layers.
+        src_k/src_v are that pool's (possibly IPC-mapped) buffers. Async by default: the
+        copy is enqueued on the default stream (SGLang's forward_stream.wait_stream orders
+        it before the model read); the source was synchronized at park time."""
         local_dev = f"cuda:{self.gpu_id}"
         lo, hi = park_start + existing, park_start + n
         for layer in range(len(self.k_buffer)):
-            self.k_buffer[layer][dst_idx] = pool.k[layer][lo:hi].to(local_dev)
-            self.v_buffer[layer][dst_idx] = pool.v[layer][lo:hi].to(local_dev)
+            self.k_buffer[layer][dst_idx] = src_k[layer][lo:hi].to(local_dev)
+            self.v_buffer[layer][dst_idx] = src_v[layer][lo:hi].to(local_dev)
         if self.sync_fetch:
             torch.cuda.synchronize(self.gpu_id)
 
@@ -1040,11 +1080,12 @@ class IdleKVParkManager:
             return 0
         if not token_ids:
             return 0
-        hit = self._match_park_prefix(token_ids)
+        hit = self._find_fetch_source(token_ids)
         if hit is None:
             self._fetch_miss += 1
             return 0
-        pool, start, n = hit
+        src_k, src_v, start, n, src_gpu = hit
+        is_cross = src_gpu in self.peer_park_pools  # parked by a PEER prefill
         key = RadixKey(token_ids[:n], extra_key=None)
         existing = len(self.tree_cache.match_prefix(key).device_indices)
         if existing >= n:
@@ -1080,7 +1121,7 @@ class IdleKVParkManager:
             t0 = time.perf_counter()
             # Copy only the tail P lacks; dst[:existing] is freed after insert matches it.
             # Pass the GPU slot view directly -- no GPU->CPU->GPU round-trip (see helper).
-            self._gather_copy_park_to_local(pool, start, existing, n, dst64[existing:n])
+            self._gather_copy_park_to_local(src_k, src_v, start, existing, n, dst64[existing:n])
             ms = (time.perf_counter() - t0) * 1000.0
             new_prefix_len = self.tree_cache.insert(key, dst64)
             inserted_into_tree = True  # tree now owns dst64[new_prefix_len:]
@@ -1094,13 +1135,16 @@ class IdleKVParkManager:
         self._fetch_hits += 1
         self._fetched_tokens += fetched
         self._fetch_ms_sum += ms
+        if is_cross:
+            self._fetch_cross_hits += 1
         if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
             logger.info(
-                "Idle KV parking [prefill] GPU%d-fetch: rid=%s pulled %d tok "
-                "(P had %d of %d) x %d layers in %.1fms. total fetch hits=%d, "
+                "Idle KV parking [prefill gpu%s]-fetch: rid=%s pulled %d tok "
+                "(P had %d of %d) from gpu%s%s in %.1fms. hits=%d (cross-P=%d), "
                 "tokens=%d, avg=%.1fms.",
-                pool.gpu, getattr(req, "rid", "?"), fetched, existing, n,
-                len(self.k_buffer), ms, self._fetch_hits, self._fetched_tokens,
+                self.gpu_id, getattr(req, "rid", "?"), fetched, existing, n,
+                src_gpu, " [cross-P]" if is_cross else "", ms,
+                self._fetch_hits, self._fetch_cross_hits, self._fetched_tokens,
                 self._fetch_ms_sum / max(1, self._fetch_hits),
             )
         return fetched
@@ -1224,7 +1268,7 @@ class IdleKVParkManager:
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
-            "FETCH: hits=%d(evict-to-room=%d) tok=%d avg=%.1fms | "
+            "FETCH: hits=%d(cross-P=%d,evict-to-room=%d) tok=%d avg=%.1fms | "
             "miss=%d already=%d nospace=%d (of %d) | pools[live/N(idx)]: %s",
             self._received_msgs,
             total,
@@ -1237,6 +1281,7 @@ class IdleKVParkManager:
             survived,
             checked,
             self._fetch_hits,
+            self._fetch_cross_hits,
             self._fetch_evicted,
             self._fetched_tokens,
             self._fetch_ms_sum / max(1, self._fetch_hits),
