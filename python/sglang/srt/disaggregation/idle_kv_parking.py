@@ -411,6 +411,7 @@ class _HostParkStore:
         self.peak_bytes = 0              # since the last flush (hysteresis input)
         self.n_parked = 0
         self.n_evicted = 0
+        self.evicted_bytes = 0           # cumulative KV bytes this tier destroyed
         self.n_flushes = 0
         self.n_alloc_fail = 0
         itemsize = torch.empty((), dtype=dtype).element_size()
@@ -471,6 +472,7 @@ class _HostParkStore:
             return
         now = time.time()
         h, blk = min(self.blocks.items(), key=lambda kv: kv[1].value(now))
+        self.evicted_bytes += blk.n * self.bytes_per_token
         self._drop(h, blk)
         self.n_evicted += 1
 
@@ -516,7 +518,8 @@ class _HostParkStore:
     def stats(self) -> str:
         return (f"host: blocks={len(self.blocks)} live={self.live_bytes/1e9:.2f}GB "
                 f"peak={self.peak_bytes/1e9:.2f}GB parked={self.n_parked} "
-                f"evicted={self.n_evicted} flushes={self.n_flushes} "
+                f"evicted={self.n_evicted}({self.evicted_bytes/1e9:.2f}GB) "
+                f"flushes={self.n_flushes} "
                 f"allocfail={self.n_alloc_fail}")
 
 
@@ -616,6 +619,11 @@ class IdleKVParkManager:
         self._fetch_nospace = 0     # KV pool full even after evict-to-room (gave up)
         self._fetch_evicted = 0     # had to LRU-evict cold entries to make room (like hicache)
         self._fetch_ms_sum = 0.0
+        # Residency accounting for the placement figure: tokens this process DESTROYED,
+        # i.e. KV that no longer exists in any tier and would have to be re-prefilled.
+        # Counted separately from host-tier evictions (self._host.evicted_bytes) because
+        # a GPU eviction and a host eviction are different policy decisions.
+        self._dropped_tokens = 0
         # async fetch: enqueue the GPU2->GPU0 copy on the default stream and DON'T
         # host-synchronize. SGLang does forward_stream.wait_stream(default_stream)
         # before every forward, so the copy is guaranteed complete before the model
@@ -1185,6 +1193,21 @@ class IdleKVParkManager:
         except Exception:  # noqa: BLE001
             return None
 
+    def _serving_used_tokens(self):
+        """Tokens currently held by THIS GPU's live serving KV pool, or None.
+
+        The absolute count, not the fraction _live_kv_usage returns: the residency
+        breakdown needs local-GPU bytes in the same unit as the parked and host bytes,
+        otherwise the four categories cannot be stacked."""
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            total = getattr(alloc, "size", None)
+            if not total:
+                return None
+            return max(0, total - alloc.available_size())
+        except Exception:  # noqa: BLE001
+            return None
+
     def _bytes_per_token(self) -> int:
         """KV bytes one token occupies across all layers (K and V)."""
         k0 = self.k_buffer[0]
@@ -1210,6 +1233,27 @@ class IdleKVParkManager:
                 "host_flushes": self._host.n_flushes if self._host else 0,
                 "host_evicted": self._host.n_evicted if self._host else 0,
                 "bytes_per_token": bpt,
+                # --- residency breakdown (local GPU / peer GPU / CPU DRAM / evicted).
+                # "serving" is the live radix KV on THIS GPU, so the four categories
+                # together account for every reusable KV byte the process ever held.
+                # gpu_bytes above is keyed by target GPU, so peer vs local-park is
+                # derivable from writer_gpu without a second source of truth.
+                "serving_bytes": int(self._serving_used_tokens() or 0) * bpt,
+                "dropped_bytes": int(self._dropped_tokens) * bpt,
+                "host_evicted_bytes": int(self._host.evicted_bytes) if self._host else 0,
+                # --- where fetches were satisfied from (the counterpart of the above:
+                # residency only matters if the KV is actually read back)
+                "fetch_hits": self._fetch_hits,
+                "fetch_peer_hits": self._fetch_cross_hits,
+                "fetch_host_hits": self._fetch_host_hits,
+                "fetch_local_hits": max(
+                    0, self._fetch_hits - self._fetch_cross_hits - self._fetch_host_hits
+                ),
+                "fetch_miss": self._fetch_miss,
+                "fetch_already": self._fetch_already,
+                "fetch_nospace": self._fetch_nospace,
+                "fetched_tokens": self._fetched_tokens,
+                "parked_tokens": self._parked_tokens,
             }
             path = _parked_bytes_file(self.gpu_id)
             tmp = path + f".tmp.{os.getpid()}"
@@ -1424,6 +1468,7 @@ class IdleKVParkManager:
         now = time.time()
         base = min(pool.blocks, key=lambda b: _reuse_value(
             pool.blocks[b][0], pool.blocks[b][2], now))
+        self._dropped_tokens += pool.blocks[base][0]
         self._clear_slab_index(pool, base)
         pool.slab_release(base)
 
