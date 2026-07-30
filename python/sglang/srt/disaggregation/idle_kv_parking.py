@@ -106,6 +106,35 @@ def _gpu_usage_file(gpu: int) -> str:
 # (slot 0 is the padded dummy); the allocator overwrites them on real use.
 SELFTEST_N_SLOTS = 64
 
+# --- Phase 3: CPU DRAM overflow tier (placement priority 3) --------------------------
+# Reached only when no GPU has room, so that "GPU-first" has something to fall back to
+# and can be compared against. Deliberately NOT a pre-allocated pool: HiCache reserves
+# a host KV pool up front (measured 61 GB, held whether the cache is 5% or 95% full),
+# and re-creating that here would defeat the whole claim. Each block's pinned host
+# memory is allocated at park time and released on eviction, so committed host DRAM
+# tracks cached KV.
+HOST_OVERFLOW = os.environ.get("SGLANG_KV_PARK_HOST_OVERFLOW", "0") == "1"
+# Allocation sizes are QUANTIZED to a multiple of this many tokens. Measured on
+# server17: a cold pin costs ~480-640 ms/GiB, but a repeat request for the SAME size is
+# ~0 ms because PyTorch caches host allocations. With arbitrary per-session sizes every
+# park would be a cold pin (~360 ms for a 750 MiB session vs a 28.6 ms transfer), so
+# bucketing is what makes this tier viable, not an optimization.
+HOST_BUCKET_TOKENS = int(os.environ.get("SGLANG_KV_PARK_HOST_BUCKET_TOKENS", "2048"))
+# Upper LIMIT on host bytes held by this tier -- a cap, not a reservation: nothing is
+# allocated until a park actually overflows. Keeps the tier from eating the DRAM the
+# agent stack needs. 0 = unlimited.
+HOST_MAX_BYTES = int(float(os.environ.get("SGLANG_KV_PARK_HOST_MAX_GB", "8")) * 2**30)
+# Releasing a block returns it to PyTorch's caching host allocator, NOT to the OS, so
+# RSS would stay at the high-water mark and "committed == cached" would be false. We
+# therefore flush the host cache when the parked set genuinely SHRINKS: live bytes fell
+# to below SHRINK_FRAC of the peak since the last flush, and the drop is at least
+# FLUSH_MIN. Hysteresis matters -- flushing on every eviction under steady churn would
+# pay the ~480 ms/GiB re-pin cost over and over.
+HOST_SHRINK_FRAC = float(os.environ.get("SGLANG_KV_PARK_HOST_SHRINK_FRAC", "0.6"))
+HOST_FLUSH_MIN_BYTES = int(
+    float(os.environ.get("SGLANG_KV_PARK_HOST_FLUSH_MIN_GB", "1")) * 2**30
+)
+
 # Rolling polynomial prefix hash (fetch-path optimization). Park stores an entry
 # keyed by the hash of its token_ids at two page-aligned boundaries; fetch must probe
 # the request's prefix at each parked length. Computing hash(tuple(token_ids[:L])) per
@@ -251,6 +280,183 @@ def _open_ipc(desc: dict) -> torch.Tensor:
         )
 
 
+def _host_empty_cache() -> bool:
+    """Ask PyTorch to return cached-but-unused pinned host memory to the OS.
+
+    `del`eting a pinned tensor only hands it back to PyTorch's caching host allocator,
+    so RSS stays at the high-water mark. Only this flush actually releases it, which is
+    what makes committed host DRAM track cached KV instead of the peak. Measured on
+    torch 2.9.1: RSS +1024 MB after a free becomes +0 MB after the flush. The API is
+    private and has moved between versions, hence the probing."""
+    for fn in (
+        getattr(torch._C, "_host_emptyCache", None),
+        getattr(torch.cuda, "host_empty_cache", None),
+        getattr(torch._C, "_cuda_hostEmptyCache", None),
+    ):
+        if fn is None:
+            continue
+        try:
+            fn()
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+class _HostBlock:
+    """One parked prefix living in pinned host memory.
+
+    All layers share ONE allocation of shape (2L, bucket_tokens, head_num, head_dim):
+    layer l's K is t[l] and its V is t[L + l]. One tensor rather than 2L separate ones
+    because the caching host allocator keys on size -- 2L allocations per park would
+    multiply the number of live size classes and turn warm hits into cold pins."""
+
+    __slots__ = ("t", "n", "bucket", "hashes", "nbytes")
+
+    def __init__(self, layers, bucket, head_num, head_dim, dtype):
+        self.t = torch.empty(
+            (2 * layers, bucket, head_num, head_dim), dtype=dtype, pin_memory=True
+        )
+        self.bucket = bucket
+        self.n = 0
+        self.hashes = []
+        self.nbytes = self.t.numel() * self.t.element_size()
+
+    def k(self, layer: int):
+        return self.t[layer]
+
+    def v(self, layer: int, layers: int):
+        return self.t[layers + layer]
+
+
+class _HostParkStore:
+    """CPU DRAM overflow tier (placement priority 3).
+
+    Not a pool: blocks are allocated on demand at quantized sizes and freed on
+    eviction, with an explicit host-cache flush once the live set shrinks (see
+    HOST_* knobs). Process-local by necessity -- pinned host memory has no IPC handle,
+    so a block is only readable in the process that allocated it; the shared index still
+    records these parks as LOC_HOST with the owning pid so other nodes know the prefix
+    exists elsewhere and can choose to recompute instead of duplicating it."""
+
+    def __init__(self, layers, head_num, head_dim, dtype, max_bytes=HOST_MAX_BYTES):
+        self.layers = layers
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.max_bytes = max_bytes
+        from collections import Counter, OrderedDict
+
+        self.blocks = OrderedDict()      # hash -> _HostBlock (LRU: first = coldest)
+        self.lens = Counter()            # parked lengths present (fetch-probe support)
+        self.live_bytes = 0
+        self.peak_bytes = 0              # since the last flush (hysteresis input)
+        self.n_parked = 0
+        self.n_evicted = 0
+        self.n_flushes = 0
+        self.n_alloc_fail = 0
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        self.bytes_per_token = 2 * layers * head_num * head_dim * itemsize
+
+    # ------------------------------------------------------------------ accounting
+
+    def bucket_for(self, n: int) -> int:
+        b = HOST_BUCKET_TOKENS
+        return max(b, ((n + b - 1) // b) * b)
+
+    def would_exceed(self, n: int) -> bool:
+        if self.max_bytes <= 0:
+            return False
+        return self.live_bytes + self.bucket_for(n) * self.bytes_per_token > self.max_bytes
+
+    # ------------------------------------------------------------------- mutations
+
+    def alloc(self, n: int):
+        """Allocate a block for n tokens, evicting LRU blocks first if the cap is hit.
+        Returns the block, or None if even that is not enough."""
+        while self.would_exceed(n) and self.blocks:
+            self.evict_lru()
+        if self.would_exceed(n):
+            return None
+        try:
+            blk = _HostBlock(self.layers, self.bucket_for(n), self.head_num,
+                             self.head_dim, self.dtype)
+        except Exception as e:  # noqa: BLE001  (host OOM / pin failure)
+            self.n_alloc_fail += 1
+            logger.warning("Idle KV parking [host]: pinned alloc of %d tokens failed (%r)",
+                           self.bucket_for(n), e)
+            return None
+        blk.n = n
+        self.live_bytes += blk.nbytes
+        self.peak_bytes = max(self.peak_bytes, self.live_bytes)
+        self.n_parked += 1
+        return blk
+
+    def put(self, h: int, blk: "_HostBlock", n: int) -> None:
+        blk.hashes.append(h)
+        self.blocks[h] = blk
+        self.blocks.move_to_end(h)
+        self.lens[n] += 1
+
+    def get(self, h: int):
+        blk = self.blocks.get(h)
+        if blk is not None:
+            self.blocks.move_to_end(h)     # LRU touch on read
+        return blk
+
+    def evict_lru(self) -> None:
+        if not self.blocks:
+            return
+        h, blk = next(iter(self.blocks.items()))
+        self._drop(h, blk)
+        self.n_evicted += 1
+
+    def drop(self, h: int) -> bool:
+        blk = self.blocks.get(h)
+        if blk is None:
+            return False
+        self._drop(h, blk)
+        return True
+
+    def _drop(self, h: int, blk: "_HostBlock") -> None:
+        # A block is indexed under several hashes (full length and prompt prefix), so
+        # every alias must leave the index or a later lookup would hand back freed memory.
+        for hh in list(blk.hashes):
+            if self.blocks.get(hh) is blk:
+                del self.blocks[hh]
+        self.blocks.pop(h, None)
+        self.lens[blk.n] -= 1
+        if self.lens[blk.n] <= 0:
+            del self.lens[blk.n]
+        self.live_bytes -= blk.nbytes
+        del blk
+        self.maybe_flush()
+
+    def maybe_flush(self) -> bool:
+        """Return the freed pages to the OS once the live set has genuinely shrunk.
+        Without this, RSS sticks at the peak and "committed host DRAM == cached KV"
+        would be false; with it on every eviction, steady churn would re-pay ~480 ms/GiB
+        to re-pin. Hence the two-sided condition."""
+        drop = self.peak_bytes - self.live_bytes
+        if (self.live_bytes < self.peak_bytes * HOST_SHRINK_FRAC
+                and drop >= HOST_FLUSH_MIN_BYTES):
+            if _host_empty_cache():
+                self.n_flushes += 1
+                logger.info(
+                    "Idle KV parking [host]: flushed host cache (live %.2f GB, peak "
+                    "%.2f GB, released ~%.2f GB)",
+                    self.live_bytes / 1e9, self.peak_bytes / 1e9, drop / 1e9)
+            self.peak_bytes = self.live_bytes
+            return True
+        return False
+
+    def stats(self) -> str:
+        return (f"host: blocks={len(self.blocks)} live={self.live_bytes/1e9:.2f}GB "
+                f"peak={self.peak_bytes/1e9:.2f}GB parked={self.n_parked} "
+                f"evicted={self.n_evicted} flushes={self.n_flushes} "
+                f"allocfail={self.n_alloc_fail}")
+
+
 class IdleKVParkManager:
     """Manage idle-time KV parking between decode and prefill nodes.
 
@@ -340,6 +546,7 @@ class IdleKVParkManager:
         # slice 4b: fetch-on-hit (prefill pulls a parked prefix back before prefill).
         self._fetch_hits = 0        # requests whose parked prefix was fetched into radix
         self._fetch_cross_hits = 0  # of those, fetched from a PEER prefill's park pool
+        self._fetch_host_hits = 0   # of those, fetched from the CPU DRAM overflow tier
         self._fetched_tokens = 0    # tokens copied park-GPU -> local + inserted
         self._fetch_miss = 0        # request had no parked prefix
         self._fetch_already = 0     # P already had the prefix (natural radix hit)
@@ -368,6 +575,12 @@ class IdleKVParkManager:
         # published to /dev/shm; see link_bandwidth.py. Set 0 to disable.
         self.bw_aware = os.environ.get("SGLANG_KV_PARK_BW_AWARE", "1") == "1"
         self._linkbw = None      # lazily attached on first park (GPUs must be up)
+
+        # Phase 3 placement priority 3: CPU DRAM overflow. Built lazily on the first
+        # overflow so a run that never overflows allocates no host memory at all --
+        # that is the point of the tier (see the HOST_* knobs).
+        self.host_overflow = HOST_OVERFLOW
+        self._host: Optional["_HostParkStore"] = None
 
         # slice 4 / Phase 2 slice 1: park pools on one or more idle GPUs. Parking picks,
         # per request, the pool with the most headroom (opportunistic idle-GPU placement).
@@ -957,6 +1170,71 @@ class IdleKVParkManager:
             self.bw_aware = False
         return self._linkbw
 
+    def _host_store(self):
+        """Lazily build the CPU DRAM overflow tier. Returns None if disabled."""
+        if not self.host_overflow:
+            return None
+        if self._host is None:
+            k0 = self.k_buffer[0]
+            self._host = _HostParkStore(
+                layers=len(self.k_buffer), head_num=k0.shape[1], head_dim=k0.shape[2],
+                dtype=k0.dtype)
+            logger.info(
+                "Idle KV parking: CPU DRAM overflow enabled -- bucket=%d tok "
+                "(%.0f MB/bucket), cap=%.1f GB (a limit, not a reservation)",
+                HOST_BUCKET_TOKENS,
+                HOST_BUCKET_TOKENS * self._host.bytes_per_token / 1e6,
+                HOST_MAX_BYTES / 2**30 if HOST_MAX_BYTES else float("inf"))
+        return self._host
+
+    def _park_to_host(self, token_ids, src_k, src_v, src_indices, n: int,
+                      prefix_len: int, src_gpu: int) -> bool:
+        """Placement priority 3: no GPU had room, so keep the KV in CPU DRAM instead of
+        dropping it (which would cost a full re-prefill next turn: measured 1203 ms at
+        8k against a 40 ms host restore). Returns True if parked."""
+        store = self._host_store()
+        if store is None:
+            return False
+        blk = store.alloc(n)
+        if blk is None:
+            return False
+        h = _prefix_hash(token_ids, n)
+        L = store.layers
+        t0 = time.perf_counter()
+        # D2H gather, one contiguous pinned destination per layer. non_blocking is safe
+        # because the destination is pinned; we synchronize before publishing the entry.
+        for layer in range(L):
+            blk.t[layer][:n].copy_(src_k[layer][src_indices], non_blocking=True)
+            blk.t[L + layer][:n].copy_(src_v[layer][src_indices], non_blocking=True)
+        torch.cuda.synchronize(src_gpu if src_gpu >= 0 else self.gpu_id)
+        ms = (time.perf_counter() - t0) * 1000.0
+
+        store.put(h, blk, n)
+        if 0 < prefix_len < n:
+            hp = _prefix_hash(token_ids, prefix_len)
+            if hp not in store.blocks:
+                # same block, second boundary: record the alias so eviction removes both
+                blk.hashes.append(hp)
+                store.blocks[hp] = blk
+                store.lens[prefix_len] += 1
+        # Mirror to the shared index as host-resident owned by THIS pid, so another node
+        # learns the prefix exists but knows it cannot read it (no IPC for pinned host)
+        # and can recompute rather than park a duplicate.
+        if self._shared_index is not None:
+            from sglang.srt.disaggregation.shared_park_index import LOC_HOST
+
+            self._shared_index.insert(h, os.getpid(), 0, n, loc=LOC_HOST)
+            if 0 < prefix_len < n:
+                self._shared_index.insert(_prefix_hash(token_ids, prefix_len),
+                                          os.getpid(), 0, prefix_len, loc=LOC_HOST)
+        self._copied_count += 1
+        self._n_sum += n
+        self._recent_parked.append((h, n))
+        if store.n_parked <= 5 or store.n_parked % 50 == 0:
+            logger.info("Idle KV parking [host]: %d tok x %d layers in %.1fms | %s",
+                        n, L, ms, store.stats())
+        return True
+
     def _select_pool(self) -> "_ParkPool":
         """Pick the target pool for a new park.
 
@@ -997,11 +1275,15 @@ class IdleKVParkManager:
         return min(self._pools, key=key)
 
     def _find_parked(self, h: int):
-        """Return (pool, entry) if hash h is parked in any pool, else (None, None)."""
+        """Return (pool, entry) if hash h is parked in any pool, else (None, None).
+        Host-resident blocks count as parked too -- otherwise an overflowed prefix would
+        be parked a second time on the next turn, once in CPU DRAM and once on a GPU."""
         for p in self._pools:
             ent = p.index.get(h)
             if ent is not None:
                 return p, ent
+        if self._host is not None and self._host.get(h) is not None:
+            return self._host, None
         return None, None
 
     def _clear_slab_index(self, pool, base) -> None:
@@ -1069,6 +1351,7 @@ class IdleKVParkManager:
         prompt prefix (always matchable next turn) + full length (generated-tokens recur)."""
         if n > PARK_POOL_TOKENS or not self._pools:
             return
+        _host_fallback = None      # set below when no GPU pool can take this park
         # Source decode pool this KV lives in (N-node). Fall back to the single-peer
         # buffer for 1P1D back-compat.
         src = self.peer_decode_pools.get(src_gpu)
@@ -1079,17 +1362,24 @@ class IdleKVParkManager:
         else:
             src_k, src_v = src
         h = _prefix_hash(token_ids, n)
-        found, _ = self._find_parked(h)
+        found, fent = self._find_parked(h)
         if found is not None:
-            found.index.move_to_end(h)
-            self._skipped_count += 1  # already parked (in some pool)
+            # fent is None for a host-resident hit, whose LRU was already touched inside
+            # _HostParkStore.get(); only GPU pools need the explicit touch here.
+            if fent is not None:
+                found.index.move_to_end(h)
+            self._skipped_count += 1  # already parked (on some GPU or in CPU DRAM)
             return
-        pool = self._select_pool()  # opportunistic: most-idle GPU
+        pool = self._select_pool()  # opportunistic: most-idle GPU, fast link first
         if pool.session_keyed:
             # This conversation reuses its own slab (found by prefix-supersession),
             # overwritten in place; a new conversation takes a free slab (evict LRU if
-            # none). Fixed-size slabs => no fragmentation. Too-big-for-a-slab => skip.
+            # none). Fixed-size slabs => no fragmentation.
             if n > pool.slab:
+                # Too big for any GPU slab -> priority 3 (CPU DRAM) rather than dropping.
+                if self._park_to_host(token_ids, src_k, src_v, src_indices, n,
+                                      prefix_len, src_gpu):
+                    return
                 return
             start = self._supersede_slab(pool, token_ids, n)  # own slab, or None (new)
             if start is not None:
@@ -1101,6 +1391,10 @@ class IdleKVParkManager:
                     self._fetch_evicted += 1
                     start = pool.slab_alloc()
                 if start is None:
+                    # Every GPU slab is in use by a live session -> priority 3.
+                    if self._park_to_host(token_ids, src_k, src_v, src_indices, n,
+                                          prefix_len, src_gpu):
+                        return
                     self._fetch_nospace += 1
                     return
         else:
@@ -1202,6 +1496,8 @@ class IdleKVParkManager:
         union_lens = set()
         for p in self._pools:
             union_lens.update(L for L in p.lens if L <= n_req)
+        if self._host is not None:
+            union_lens.update(L for L in self._host.lens if L <= n_req)
         if self._shared_index is not None:
             union_lens.update(L for L in self._peer_park_lengths() if L <= n_req)
         if not union_lens:
@@ -1221,6 +1517,13 @@ class IdleKVParkManager:
                 if ent is not None and ent[1] == L:
                     p.index.move_to_end(hL)  # LRU touch on read
                     return p.k, p.v, ent[0], ent[1], p.gpu
+            if self._host is not None:  # then CPU DRAM (process-local, priority 3)
+                blk = self._host.get(hL)
+                if blk is not None and blk.n >= L:
+                    # gpu=-1 marks a host-resident hit; the fetch copy switches to H2D.
+                    nl = self._host.layers
+                    return ([blk.t[i] for i in range(nl)],
+                            [blk.t[nl + i] for i in range(nl)], 0, L, -1)
             if self._shared_index is not None:  # then peer pools via shared index
                 ent = self._shared_index.lookup(hL)
                 # Host-resident entries are skipped here: pinned host memory has no IPC
@@ -1265,6 +1568,9 @@ class IdleKVParkManager:
             return 0
         src_k, src_v, start, n, src_gpu = hit
         is_cross = src_gpu in self.peer_park_pools  # parked by a PEER prefill
+        is_host = src_gpu < 0                       # CPU DRAM overflow tier (priority 3)
+        if is_host:
+            self._fetch_host_hits += 1
         key = RadixKey(token_ids[:n], extra_key=None)
         existing = len(self.tree_cache.match_prefix(key).device_indices)
         if existing >= n:
@@ -1319,12 +1625,13 @@ class IdleKVParkManager:
         if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
             logger.info(
                 "Idle KV parking [prefill gpu%s]-fetch: rid=%s pulled %d tok "
-                "(P had %d of %d) from gpu%s%s in %.1fms. hits=%d (cross-P=%d), "
+                "(P had %d of %d) from %s%s in %.1fms. hits=%d (cross-P=%d, host=%d), "
                 "tokens=%d, avg=%.1fms.",
                 self.gpu_id, getattr(req, "rid", "?"), fetched, existing, n,
-                src_gpu, " [cross-P]" if is_cross else "", ms,
-                self._fetch_hits, self._fetch_cross_hits, self._fetched_tokens,
-                self._fetch_ms_sum / max(1, self._fetch_hits),
+                "CPU DRAM" if is_host else f"gpu{src_gpu}",
+                " [cross-P]" if is_cross else "", ms,
+                self._fetch_hits, self._fetch_cross_hits, self._fetch_host_hits,
+                self._fetched_tokens, self._fetch_ms_sum / max(1, self._fetch_hits),
             )
         return fetched
 
@@ -1447,8 +1754,8 @@ class IdleKVParkManager:
         logger.info(
             "Idle KV parking [prefill] DIAG: recv=%d processed=%d backlog=%d | "
             "skip=%d(%.0f%%) copy=%d avg-P-had=%.2f | survival=%.0f%% (%d/%d) | "
-            "FETCH: hits=%d(cross-P=%d,evict-to-room=%d) tok=%d avg=%.1fms | "
-            "miss=%d already=%d nospace=%d (of %d) | pools[live/N(idx)]: %s",
+            "FETCH: hits=%d(cross-P=%d,host=%d,evict-to-room=%d) tok=%d avg=%.1fms | "
+            "miss=%d already=%d nospace=%d (of %d) | pools[live/N(idx)]: %s%s",
             self._received_msgs,
             total,
             self._incoming.qsize(),
@@ -1461,6 +1768,7 @@ class IdleKVParkManager:
             checked,
             self._fetch_hits,
             self._fetch_cross_hits,
+            self._fetch_host_hits,
             self._fetch_evicted,
             self._fetched_tokens,
             self._fetch_ms_sum / max(1, self._fetch_hits),
@@ -1469,4 +1777,5 @@ class IdleKVParkManager:
             self._fetch_nospace,
             fetch_attempts,
             pool_occ,
+            f" | {self._host.stats()}" if self._host is not None else "",
         )
