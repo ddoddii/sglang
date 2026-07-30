@@ -22,6 +22,7 @@ without CUDA_VISIBLE_DEVICES isolation and place them with --base-gpu-id instead
 otherwise _new_shared_cuda cannot open a handle for an invisible device.
 """
 
+import json
 import logging
 import os
 import pickle
@@ -100,6 +101,14 @@ def _gpu_usage_file(gpu: int) -> str:
     its own GPU's KV pool usage here; the parking node reads candidate GPUs' usage to
     place a park onto whichever GPU is momentarily idle (pressure-aware placement)."""
     return os.path.join(PARK_DIR, f"usage_gpu{gpu}.txt")
+
+
+def _parked_bytes_file(gpu: int) -> str:
+    """Per-location parked-bytes telemetry (Phase 3). Answers, over time, 'how much of
+    the reusable KV is sitting in idle GPU HBM versus in CPU DRAM?' -- the evidence that
+    GPU-first placement actually happens rather than being asserted. Sampled by
+    benchmark/park_location_sampler.py; one file per publishing process."""
+    return os.path.join(PARK_DIR, f"parked_gpu{gpu}.json")
 
 # slice 2b self-test: number of KV slots to round-trip D->P to validate the
 # multi-layer indexed gather-copy over NVLink. Uses free slots [1..N] at startup
@@ -1176,8 +1185,43 @@ class IdleKVParkManager:
         except Exception:  # noqa: BLE001
             return None
 
+    def _bytes_per_token(self) -> int:
+        """KV bytes one token occupies across all layers (K and V)."""
+        k0 = self.k_buffer[0]
+        return 2 * len(self.k_buffer) * k0.shape[1] * k0.shape[2] * k0.element_size()
+
+    def _publish_parked_bytes(self) -> None:
+        """Publish where this process's parked KV physically lives, in bytes.
+
+        Written as its own file rather than folded into the usage file because the two
+        have different consumers: usage drives placement (read by peers in the hot path),
+        this is offline telemetry for the placement figure."""
+        try:
+            bpt = self._bytes_per_token()
+            payload = {
+                "ts": round(time.time(), 2),
+                "writer_gpu": self.gpu_id,
+                "pid": os.getpid(),
+                # per-target-GPU so a stacked plot can separate local from peer parking
+                "gpu_bytes": {str(p.gpu): int(p.occupancy()) * bpt for p in self._pools},
+                "host_bytes": int(self._host.live_bytes) if self._host else 0,
+                "host_peak_bytes": int(self._host.peak_bytes) if self._host else 0,
+                "host_blocks": len(self._host.blocks) if self._host else 0,
+                "host_flushes": self._host.n_flushes if self._host else 0,
+                "host_evicted": self._host.n_evicted if self._host else 0,
+                "bytes_per_token": bpt,
+            }
+            path = _parked_bytes_file(self.gpu_id)
+            tmp = path + f".tmp.{os.getpid()}"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)      # atomic: a sampler never sees a partial file
+        except Exception:  # noqa: BLE001
+            pass
+
     def _publish_usage_loop(self) -> None:
-        """Write this GPU's live serving KV usage to its telemetry file every 0.5s."""
+        """Write this GPU's live serving KV usage to its telemetry file every 0.5s, plus
+        the per-location parked-bytes telemetry (Phase 3)."""
         path = _gpu_usage_file(self.gpu_id)
         while True:
             u = self._live_kv_usage()
@@ -1189,6 +1233,8 @@ class IdleKVParkManager:
                     os.replace(tmp, path)
                 except Exception:  # noqa: BLE001
                     pass
+            if self._pools:
+                self._publish_parked_bytes()
             time.sleep(0.5)
 
     def _read_gpu_usage(self, gpu: int, stale_s: float = 5.0):
