@@ -135,6 +135,51 @@ HOST_FLUSH_MIN_BYTES = int(
     float(os.environ.get("SGLANG_KV_PARK_HOST_FLUSH_MIN_GB", "1")) * 2**30
 )
 
+# --- Phase 3: reuse value (what to give up first) ------------------------------------
+# Plain LRU throws away whichever block was touched longest ago, which ignores the one
+# thing that actually differs between parked prefixes: how expensive they are to get
+# back. Re-prefilling 32k tokens costs 6681 ms but 1k costs 161 ms (measured,
+# results/intro/fig_ttft_ctx_sweep.json), so under LRU a slightly-staler 32k session
+# loses to a fresh 1k one and the system pays 40x more to rebuild it.
+#
+# This is also the semantics the CUDA Unified Memory argument turns on: UM cannot know
+# how long a re-prefill a page costs. If our own policy were pure LRU, that criticism
+# would apply to us too, so reuse value is load-bearing for the paper, not a tweak.
+#
+#   reuse_value = reprefill_ms(n) * 0.5 ** (age / halflife)
+#
+# reprefill_ms is a least-squares fit of a*n + b*n^2 to the measured sweep above
+# (residuals: -17% at 1k, -7% at 2k, -4% at 4k, <1% at 8k/16k/32k -- accurate exactly
+# where the stakes are highest). The quadratic term is attention's O(n^2); a purely
+# linear model would under-value long prefixes. RE-FIT THESE PER MODEL AND GPU: they
+# encode Llama-3.1-8B on an A6000, not a universal constant.
+REUSE_AWARE = os.environ.get("SGLANG_KV_PARK_REUSE_AWARE", "1") == "1"
+PREFILL_MS_PER_TOK = float(os.environ.get("SGLANG_KV_PARK_PREFILL_MS_PER_TOK", "0.131656"))
+PREFILL_MS_PER_TOK2 = float(
+    os.environ.get("SGLANG_KV_PARK_PREFILL_MS_PER_TOK2", "2.40638e-06")
+)
+# Staleness halflife. Tuned to agentic multi-turn: the next turn of a live session
+# arrives one tool call later (seconds), so a block untouched for several halflives is
+# most likely a finished conversation. Too short degenerates to LRU; too long keeps dead
+# sessions resident ahead of live ones.
+REUSE_HALFLIFE_S = float(os.environ.get("SGLANG_KV_PARK_REUSE_HALFLIFE_S", "30"))
+
+
+def _reprefill_ms(n_tokens: int) -> float:
+    """Estimated cost of rebuilding an n-token prefix from scratch (see REUSE_* notes)."""
+    n = float(max(0, n_tokens))
+    return PREFILL_MS_PER_TOK * n + PREFILL_MS_PER_TOK2 * n * n
+
+
+def _reuse_value(n_tokens: int, last_touch: float, now: float = None) -> float:
+    """Worth of keeping this parked prefix: what a miss would cost, discounted by how
+    stale it is. Lower value = evict/demote first."""
+    if not REUSE_AWARE:
+        # LRU-equivalent: older wins the "evict me" contest regardless of size.
+        return last_touch
+    age = max(0.0, (now if now is not None else time.time()) - last_touch)
+    return _reprefill_ms(n_tokens) * (0.5 ** (age / REUSE_HALFLIFE_S))
+
 # Rolling polynomial prefix hash (fetch-path optimization). Park stores an entry
 # keyed by the hash of its token_ids at two page-aligned boundaries; fetch must probe
 # the request's prefix at each parked length. Computing hash(tuple(token_ids[:L])) per
@@ -311,7 +356,7 @@ class _HostBlock:
     because the caching host allocator keys on size -- 2L allocations per park would
     multiply the number of live size classes and turn warm hits into cold pins."""
 
-    __slots__ = ("t", "n", "bucket", "hashes", "nbytes")
+    __slots__ = ("t", "n", "bucket", "hashes", "nbytes", "ts")
 
     def __init__(self, layers, bucket, head_num, head_dim, dtype):
         self.t = torch.empty(
@@ -321,6 +366,10 @@ class _HostBlock:
         self.n = 0
         self.hashes = []
         self.nbytes = self.t.numel() * self.t.element_size()
+        self.ts = time.time()      # last touch; input to _reuse_value
+
+    def value(self, now=None) -> float:
+        return _reuse_value(self.n, self.ts, now)
 
     def k(self, layer: int):
         return self.t[layer]
@@ -375,7 +424,7 @@ class _HostParkStore:
         """Allocate a block for n tokens, evicting LRU blocks first if the cap is hit.
         Returns the block, or None if even that is not enough."""
         while self.would_exceed(n) and self.blocks:
-            self.evict_lru()
+            self.evict_victim()
         if self.would_exceed(n):
             return None
         try:
@@ -401,13 +450,18 @@ class _HostParkStore:
     def get(self, h: int):
         blk = self.blocks.get(h)
         if blk is not None:
-            self.blocks.move_to_end(h)     # LRU touch on read
+            self.blocks.move_to_end(h)     # LRU order (still used as the tiebreak)
+            blk.ts = time.time()           # recency input to reuse value
         return blk
 
-    def evict_lru(self) -> None:
+    def evict_victim(self) -> None:
+        """Give up the LEAST valuable block: cheapest to rebuild, discounted by
+        staleness (_reuse_value). Under plain LRU a slightly-staler 32k session would
+        lose to a fresh 1k one, and rebuilding it costs 40x more."""
         if not self.blocks:
             return
-        h, blk = next(iter(self.blocks.items()))
+        now = time.time()
+        h, blk = min(self.blocks.items(), key=lambda kv: kv[1].value(now))
         self._drop(h, blk)
         self.n_evicted += 1
 
@@ -1286,13 +1340,25 @@ class IdleKVParkManager:
             return self._host, None
         return None, None
 
+    def _touch_slab(self, pool, base) -> None:
+        """Refresh a slab's last-touch time (recency input to _reuse_value).
+
+        Must be called on every READ hit, not just on write: pool.index's LRU order and
+        pool.blocks' timestamp are separate, so without this a session fetched every turn
+        would keep looking stale and get evicted despite being the hottest thing in the
+        pool -- exactly backwards."""
+        blk = pool.blocks.get(base)
+        if blk is not None:
+            pool.blocks[base] = (blk[0], blk[1], time.time())
+            pool.blocks.move_to_end(base)
+
     def _clear_slab_index(self, pool, base) -> None:
         """Drop the index entries of the block currently in slab `base` (local + shared),
         without releasing the slab. Used before overwriting a session's slab in place."""
         blk = pool.blocks.pop(base, None)
         if blk is None:
             return
-        _n_b, hashes = blk
+        _n_b, hashes, _ts_b = blk
         for hh in hashes:
             ent = pool.index.pop(hh, None)
             if ent is not None:
@@ -1304,10 +1370,14 @@ class IdleKVParkManager:
                     self._shared_index.remove(hh)
 
     def _evict_slab(self, pool) -> None:
-        """Evict the LRU slab: clear its index and return the slab to the free list."""
+        """Give up the LEAST valuable slab, not simply the oldest: cheapest to rebuild,
+        discounted by staleness (_reuse_value). With REUSE_AWARE=0 the value function
+        degenerates to the timestamp, which reproduces the previous LRU behaviour."""
         if not pool.blocks:
             return
-        base = next(iter(pool.blocks))  # oldest (LRU)
+        now = time.time()
+        base = min(pool.blocks, key=lambda b: _reuse_value(
+            pool.blocks[b][0], pool.blocks[b][2], now))
         self._clear_slab_index(pool, base)
         pool.slab_release(base)
 
@@ -1368,6 +1438,7 @@ class IdleKVParkManager:
             # _HostParkStore.get(); only GPU pools need the explicit touch here.
             if fent is not None:
                 found.index.move_to_end(h)
+                self._touch_slab(found, fent[0])
             self._skipped_count += 1  # already parked (on some GPU or in CPU DRAM)
             return
         pool = self._select_pool()  # opportunistic: most-idle GPU, fast link first
@@ -1431,7 +1502,7 @@ class IdleKVParkManager:
                 if self._shared_index is not None:
                     self._shared_index.insert(hp, pool.gpu, start, prefix_len)
         if pool.session_keyed:
-            pool.blocks[start] = (n, hashes)
+            pool.blocks[start] = (n, hashes, time.time())
             pool.blocks.move_to_end(start)  # MRU
         else:
             pool.next = (start + n) % pool.N
@@ -1516,6 +1587,7 @@ class IdleKVParkManager:
                 ent = p.index.get(hL)
                 if ent is not None and ent[1] == L:
                     p.index.move_to_end(hL)  # LRU touch on read
+                    self._touch_slab(p, ent[0])   # recency for _reuse_value
                     return p.k, p.v, ent[0], ent[1], p.gpu
             if self._host is not None:  # then CPU DRAM (process-local, priority 3)
                 blk = self._host.get(hL)
