@@ -362,6 +362,13 @@ class IdleKVParkManager:
         # (e.g. dedicated spare GPUs). Set 0 to force slice-1 headroom-only selection.
         self.pressure_aware = os.environ.get("SGLANG_KV_PARK_PRESSURE_AWARE", "1") == "1"
 
+        # Phase 3 (bandwidth-aware placement): rank candidate park GPUs by the MEASURED
+        # link bandwidth to this GPU, so a PCIe-only peer (3.3 GB/s measured) is not
+        # preferred over CPU DRAM (26.3 GB/s). Matrix is measured once per node and
+        # published to /dev/shm; see link_bandwidth.py. Set 0 to disable.
+        self.bw_aware = os.environ.get("SGLANG_KV_PARK_BW_AWARE", "1") == "1"
+        self._linkbw = None      # lazily attached on first park (GPUs must be up)
+
         # slice 4 / Phase 2 slice 1: park pools on one or more idle GPUs. Parking picks,
         # per request, the pool with the most headroom (opportunistic idle-GPU placement).
         self.park_gpus = list(PARK_GPUS)
@@ -932,6 +939,24 @@ class IdleKVParkManager:
         except Exception:  # noqa: BLE001
             return None
 
+    def _link_bw(self):
+        """Lazily attach to the node's measured link-bandwidth matrix (Phase 3).
+        Returns None if unavailable, in which case selection degrades to the
+        pressure+headroom behaviour."""
+        if self._linkbw is not None or not self.bw_aware:
+            return self._linkbw
+        try:
+            from sglang.srt.disaggregation.link_bandwidth import LinkBandwidth
+
+            devs = sorted({p.gpu for p in self._pools} | {self.gpu_id})
+            self._linkbw = LinkBandwidth.get(devs)
+            logger.info("Idle KV parking: link bandwidth -> %s", self._linkbw.describe())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Idle KV parking: link-bandwidth probe failed (%r); "
+                           "placement falls back to pressure+headroom only", e)
+            self.bw_aware = False
+        return self._linkbw
+
     def _select_pool(self) -> "_ParkPool":
         """Pick the target pool for a new park.
 
@@ -939,15 +964,35 @@ class IdleKVParkManager:
         serving KV usage -- i.e. store onto whichever candidate GPU is momentarily idle
         right now -- tie-broken by park-pool headroom. A GPU with no telemetry (dedicated
         spare, no serving process) counts as idle (0.0), so this degrades to slice-1
-        headroom-only selection. Set SGLANG_KV_PARK_PRESSURE_AWARE=0 to force slice-1."""
+        headroom-only selection. Set SGLANG_KV_PARK_PRESSURE_AWARE=0 to force slice-1.
+
+        Phase 3 (bandwidth-aware): candidates whose link to THIS GPU is slower than CPU
+        DRAM are demoted below the ones that are faster. Measured on 4x A6000: an
+        NVLink-bridged peer reads at 27-53 GB/s but a PCIe-only peer at just 3.3 GB/s,
+        against 26.3 GB/s for pinned host memory -- so "any GPU beats the host" is false,
+        and picking the idlest GPU without checking the link can pick a target that is
+        7-8x worse than CPU DRAM. Set SGLANG_KV_PARK_BW_AWARE=0 to disable.
+
+        Ordering is (slow_link, serving_usage, -headroom): a fast-link pool always wins
+        over a slow-link one, and within each class the idlest/roomiest wins. Slow-link
+        pools are kept as candidates rather than dropped because they still beat a
+        recompute (3.3 GB/s restores an 8k prefix in ~297 ms vs ~1203 ms to re-prefill);
+        the host tier, once implemented, takes priority over them."""
+        lb = self._link_bw()
+
+        def slow_link(p: "_ParkPool") -> int:
+            if lb is None:
+                return 0
+            return 0 if lb.better_than_host(src=p.gpu, dst=self.gpu_id) else 1
+
         if not self.pressure_aware:
-            return max(self._pools, key=lambda p: p.headroom())
+            return min(self._pools, key=lambda p: (slow_link(p), -p.headroom()))
 
         def key(p: "_ParkPool"):
             u = self._read_gpu_usage(p.gpu)
             serving = 0.0 if u is None else u  # no telemetry => not serving => idle
-            # low serving usage first; among equally-idle GPUs prefer more headroom.
-            return (round(serving, 2), -p.headroom())
+            # fast links first; then low serving usage; then more headroom.
+            return (slow_link(p), round(serving, 2), -p.headroom())
 
         return min(self._pools, key=key)
 
@@ -1177,12 +1222,14 @@ class IdleKVParkManager:
                     p.index.move_to_end(hL)  # LRU touch on read
                     return p.k, p.v, ent[0], ent[1], p.gpu
             if self._shared_index is not None:  # then peer pools via shared index
-                got = self._shared_index.lookup(hL)
-                if got is not None:
-                    gpu, start, n = got
-                    if n == L and gpu in self.peer_park_pools:
-                        k, v = self.peer_park_pools[gpu]
-                        return k, v, start, n, gpu
+                ent = self._shared_index.lookup(hL)
+                # Host-resident entries are skipped here: pinned host memory has no IPC
+                # handle, so only the owning process can read it (ent.readable_here()).
+                # The host fetch path handles those separately.
+                if ent is not None and ent.n == L and ent.is_gpu:
+                    if ent.dev in self.peer_park_pools:
+                        k, v = self.peer_park_pools[ent.dev]
+                        return k, v, ent.start, ent.n, ent.dev
         return None
 
     def _gather_copy_park_to_local(self, src_k, src_v, park_start, existing, n, dst_idx) -> None:
