@@ -1417,9 +1417,18 @@ class IdleKVParkManager:
         and picking the idlest GPU without checking the link can pick a target that is
         7-8x worse than CPU DRAM. Set SGLANG_KV_PARK_BW_AWARE=0 to disable.
 
-        Ordering is (slow_link, full, serving_usage, -headroom): a fast-link pool always
-        wins over a slow-link one, a pool that can take this park without evicting wins
-        over one that cannot, and within each class the idlest/roomiest wins. Slow-link
+        Ordering is (full, slow_link, serving_usage, -headroom): a pool that can take
+        this park without evicting always wins, then a fast link beats a slow one, then
+        the idlest and roomiest.
+
+        `full` sits ABOVE `slow_link` on purpose. With the two swapped, a FULL
+        NVLink pool outranked an EMPTY PCIe one, so the policy evicted a live prefix
+        rather than write across a slower link -- measured on Exp 2's re-run, where P0
+        found (own: full, NVLink peer: full, PCIe peer: has room) on 255 of 271 parks and
+        chose the full NVLink peer every time. That trade is backwards by this module's
+        own numbers: a PCIe fetch restores an 8k prefix in ~297 ms against ~1203 ms to
+        re-prefill it, so keeping the data on a slow link beats losing it. The link only
+        decides between pools that can both actually hold the park. Slow-link
         pools are kept as candidates rather than dropped because they still beat a
         recompute (3.3 GB/s restores an 8k prefix in ~297 ms vs ~1203 ms to re-prefill);
         the host tier, once implemented, takes priority over them.
@@ -1462,7 +1471,7 @@ class IdleKVParkManager:
                 # EVERY pool is full the first two terms tie and the order degrades to
                 # the previous behaviour, which is what should happen: something has to
                 # be evicted and the idlest GPU is still the best place to do it.
-                return (slow_link(p), full(p), round(serving, 2), -p.headroom())
+                return (full(p), slow_link(p), round(serving, 2), -p.headroom())
 
             chosen = min(self._pools, key=key)
 
