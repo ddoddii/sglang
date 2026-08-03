@@ -1250,6 +1250,13 @@ class IdleKVParkManager:
                     0, self._fetch_hits - self._fetch_cross_hits - self._fetch_host_hits
                 ),
                 "fetch_miss": self._fetch_miss,
+                # Cumulative fetch latency. Without it a run can show the hit rate
+                # rising while TTFT gets worse and there is no way to tell whether the
+                # fetch cost more than the re-prefill it avoided -- which is exactly
+                # what Llama-2-13B did (58.3% hit rate, TTFT 0.98x). The cost scales
+                # with KV BYTES (800 KiB/token on an MHA model vs 128 on a GQA one)
+                # while the saving scales with TOKENS, so the two can invert.
+                "fetch_ms_sum": round(self._fetch_ms_sum, 1),
                 "fetch_already": self._fetch_already,
                 "fetch_nospace": self._fetch_nospace,
                 "fetched_tokens": self._fetched_tokens,
