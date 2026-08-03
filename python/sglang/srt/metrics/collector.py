@@ -214,6 +214,20 @@ class SchedulerStats:
 
     max_total_num_tokens: int = 0
 
+    # KV pool RESIDENCY, as opposed to pressure.
+    #
+    # token_usage above deliberately subtracts the evictable (prefix-cached) tokens --
+    # see _get_token_info -- because for admission control a cached block is free: the
+    # allocator can reclaim it on demand. That makes token_usage the wrong instrument for
+    # any question about the CACHE, and it fails silently rather than loudly: a prefill
+    # pool that is 100% full of retained prefixes still reports a token_usage near zero.
+    #
+    # evictable_tokens exposes the part that was being subtracted, and cache_occupancy is
+    # the complementary fraction (used + evictable) / capacity -- i.e. how much of the
+    # pool is holding KV at all, reclaimable or not.
+    evictable_tokens: int = 0
+    cache_occupancy: float = 0.0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -315,6 +329,21 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.evictable_tokens = Gauge(
+            name="sglang:evictable_tokens",
+            documentation="Tokens held by the prefix cache that the allocator may "
+            "reclaim. Excluded from sglang:token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_occupancy = Gauge(
+            name="sglang:cache_occupancy",
+            documentation="Fraction of the KV pool holding KV of any kind, "
+            "(used + evictable) / capacity. Unlike sglang:token_usage this counts "
+            "prefix-cached blocks.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -961,6 +990,8 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.evictable_tokens, stats.evictable_tokens)
+        self._log_gauge(self.cache_occupancy, stats.cache_occupancy)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )

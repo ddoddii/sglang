@@ -163,6 +163,10 @@ class SchedulerMetricsMixin:
         )
 
         # TODO: generalize this for various memory pools
+        # Only the non-hybrid path reports evictable tokens: the SWA and
+        # Mamba pools split their accounting differently, so it is left
+        # unset there rather than guessed at.
+        _evictable = None
         if self.is_hybrid_swa:
             (
                 full_num_used,
@@ -198,7 +202,7 @@ class SchedulerMetricsMixin:
                 f"mamba usage: {mamba_usage:.2f}, "
             )
         else:
-            num_used, token_usage, _, _ = self._get_token_info()
+            num_used, token_usage, _, _evictable = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
         self.stats.new_token_ratio = adder.new_token_ratio
@@ -232,6 +236,16 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
+            # Residency, not pressure: token_usage subtracts the prefix cache, so on its
+            # own it reports a pool full of cached prefixes as nearly empty.
+            _ev = _evictable
+            if _ev is not None:
+                self.stats.evictable_tokens = _ev
+                self.stats.cache_occupancy = (
+                    (num_used + _ev) / self.max_total_num_tokens
+                    if self.max_total_num_tokens
+                    else 0.0
+                )
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
@@ -302,6 +316,10 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
+        # Only the non-hybrid path reports evictable tokens: the SWA and
+        # Mamba pools split their accounting differently, so it is left
+        # unset there rather than guessed at.
+        _evictable = None
         if self.is_hybrid_swa:
             (
                 full_num_used,
@@ -341,7 +359,7 @@ class SchedulerMetricsMixin:
                 f"mamba usage: {mamba_usage:.2f}, "
             )
         else:
-            num_used, token_usage, _, _ = self._get_token_info()
+            num_used, token_usage, _, _evictable = self._get_token_info()
             token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
@@ -396,6 +414,16 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
+            # Residency, not pressure: token_usage subtracts the prefix cache, so on its
+            # own it reports a pool full of cached prefixes as nearly empty.
+            _ev = _evictable
+            if _ev is not None:
+                self.stats.evictable_tokens = _ev
+                self.stats.cache_occupancy = (
+                    (num_used + _ev) / self.max_total_num_tokens
+                    if self.max_total_num_tokens
+                    else 0.0
+                )
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
