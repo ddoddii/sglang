@@ -647,6 +647,21 @@ class IdleKVParkManager:
         self.bw_aware = os.environ.get("SGLANG_KV_PARK_BW_AWARE", "1") == "1"
         self._linkbw = None      # lazily attached on first park (GPUs must be up)
 
+        # Placement decision log (Exp 2 / M3). _select_pool returns only the winner, so
+        # the occupancy of the candidates it REJECTED is discarded -- and "the KV went
+        # where there was room" is a claim about the rejected ones. Without them a run
+        # can show placement correlating with headroom and there is no way to separate
+        # that from the workload having put the headroom where the parks were going
+        # anyway. One JSONL line per park: chosen GPU plus every candidate's live usage,
+        # headroom and link class at the instant of the decision, which also permits
+        # replaying random / round-robin / always-local null models offline from the
+        # same log rather than spending a GPU-hour per null model.
+        #
+        # Off unless a path is set: this is the hot path, one park per finished request.
+        self._decision_log = os.environ.get("SGLANG_KV_PARK_DECISION_LOG", "")
+        self._decision_fh = None
+        self._decision_t0 = time.time()
+
         # Phase 3 placement priority 3: CPU DRAM overflow. Built lazily on the first
         # overflow so a run that never overflows allocates no host memory at all --
         # that is the point of the tier (see the HOST_* knobs).
@@ -1414,16 +1429,53 @@ class IdleKVParkManager:
                 return 0
             return 0 if lb.better_than_host(src=p.gpu, dst=self.gpu_id) else 1
 
+        # Read each candidate's usage ONCE and reuse it for both the decision and the
+        # log. Reading again for the log would record a different instant than the one
+        # the decision was made on, which is the single thing the log exists to capture.
+        usage = {p.gpu: self._read_gpu_usage(p.gpu) for p in self._pools}
+
         if not self.pressure_aware:
-            return min(self._pools, key=lambda p: (slow_link(p), -p.headroom()))
+            chosen = min(self._pools, key=lambda p: (slow_link(p), -p.headroom()))
+        else:
+            def key(p: "_ParkPool"):
+                u = usage.get(p.gpu)
+                serving = 0.0 if u is None else u  # no telemetry => not serving => idle
+                # fast links first; then low serving usage; then more headroom.
+                return (slow_link(p), round(serving, 2), -p.headroom())
 
-        def key(p: "_ParkPool"):
-            u = self._read_gpu_usage(p.gpu)
-            serving = 0.0 if u is None else u  # no telemetry => not serving => idle
-            # fast links first; then low serving usage; then more headroom.
-            return (slow_link(p), round(serving, 2), -p.headroom())
+            chosen = min(self._pools, key=key)
 
-        return min(self._pools, key=key)
+        self._log_decision(chosen, usage, slow_link)
+        return chosen
+
+    def _log_decision(self, chosen, usage, slow_link) -> None:
+        """Append one JSONL record describing this placement decision (Exp 2 / M3).
+
+        Records the candidates NOT chosen, with their live usage, because that is what
+        makes "placement follows headroom" falsifiable rather than a restatement of the
+        selector's source code."""
+        if not self._decision_log:
+            return
+        try:
+            if self._decision_fh is None:
+                path = f"{self._decision_log}.gpu{self.gpu_id}.jsonl"
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                self._decision_fh = open(path, "a", buffering=1)  # survives a SIGKILL
+            self._decision_fh.write(json.dumps({
+                "t": round(time.time() - self._decision_t0, 3),
+                "src_gpu": self.gpu_id,
+                "chosen": chosen.gpu,
+                "pressure_aware": bool(self.pressure_aware),
+                # usage is None when a candidate publishes no telemetry; keep it null
+                # rather than substituting the selector's 0.0, so the analysis can tell
+                # "measured idle" from "assumed idle".
+                "cand": {str(p.gpu): {"use": usage.get(p.gpu),
+                                      "head": p.headroom(),
+                                      "slow": slow_link(p)}
+                         for p in self._pools},
+            }) + "\n")
+        except Exception:  # noqa: BLE001 -- telemetry must never fail a park
+            self._decision_log = ""   # stop retrying on a broken path
 
     def _find_parked(self, h: int):
         """Return (pool, entry) if hash h is parked in any pool, else (None, None).
