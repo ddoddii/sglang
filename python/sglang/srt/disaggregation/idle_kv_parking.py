@@ -1401,7 +1401,7 @@ class IdleKVParkManager:
                         n, L, ms, store.stats())
         return True
 
-    def _select_pool(self) -> "_ParkPool":
+    def _select_pool(self, need: int = 0) -> "_ParkPool":
         """Pick the target pool for a new park.
 
         Phase 2 slice-2 (pressure-aware): choose the pool on the GPU with the LOWEST live
@@ -1417,11 +1417,26 @@ class IdleKVParkManager:
         and picking the idlest GPU without checking the link can pick a target that is
         7-8x worse than CPU DRAM. Set SGLANG_KV_PARK_BW_AWARE=0 to disable.
 
-        Ordering is (slow_link, serving_usage, -headroom): a fast-link pool always wins
-        over a slow-link one, and within each class the idlest/roomiest wins. Slow-link
+        Ordering is (slow_link, full, serving_usage, -headroom): a fast-link pool always
+        wins over a slow-link one, a pool that can take this park without evicting wins
+        over one that cannot, and within each class the idlest/roomiest wins. Slow-link
         pools are kept as candidates rather than dropped because they still beat a
         recompute (3.3 GB/s restores an 8k prefix in ~297 ms vs ~1203 ms to re-prefill);
-        the host tier, once implemented, takes priority over them."""
+        the host tier, once implemented, takes priority over them.
+
+        `full` was NOT in this key originally, and its absence cost real capacity. Usage
+        was compared before headroom, so a peer pool with ZERO free slots (usage 0.06)
+        kept outranking a local pool that was completely empty (usage 0.86): the peer
+        won on the second key before headroom was ever consulted, and every park then
+        evicted something from the same small pool. Measured on Exp 2's park_pd arm --
+        both decode pools pinned full at 1.31 GB, the local pool at 0.00, 3.67 GB used of
+        a 7.86 GB budget, and 491 fetch hits against park_local's 594 while half the
+        park capacity sat idle. "Place where there is room" has to actually check whether
+        there is room.
+
+        `need` is the size of THIS park, so the test is "can take it without evicting",
+        not "is not literally full". A pool with 100 free slots cannot absorb a 5000-token
+        park and would evict just the same. need=0 reproduces the plain non-empty test."""
         lb = self._link_bw()
 
         def slow_link(p: "_ParkPool") -> int:
@@ -1434,21 +1449,27 @@ class IdleKVParkManager:
         # the decision was made on, which is the single thing the log exists to capture.
         usage = {p.gpu: self._read_gpu_usage(p.gpu) for p in self._pools}
 
+        def full(p: "_ParkPool") -> int:
+            return 0 if p.headroom() >= need else 1
+
         if not self.pressure_aware:
             chosen = min(self._pools, key=lambda p: (slow_link(p), -p.headroom()))
         else:
             def key(p: "_ParkPool"):
                 u = usage.get(p.gpu)
                 serving = 0.0 if u is None else u  # no telemetry => not serving => idle
-                # fast links first; then low serving usage; then more headroom.
-                return (slow_link(p), round(serving, 2), -p.headroom())
+                # fast link, then room for this park, then idlest, then roomiest. When
+                # EVERY pool is full the first two terms tie and the order degrades to
+                # the previous behaviour, which is what should happen: something has to
+                # be evicted and the idlest GPU is still the best place to do it.
+                return (slow_link(p), full(p), round(serving, 2), -p.headroom())
 
             chosen = min(self._pools, key=key)
 
-        self._log_decision(chosen, usage, slow_link)
+        self._log_decision(chosen, usage, slow_link, full, need)
         return chosen
 
-    def _log_decision(self, chosen, usage, slow_link) -> None:
+    def _log_decision(self, chosen, usage, slow_link, full=None, need=0) -> None:
         """Append one JSONL record describing this placement decision (Exp 2 / M3).
 
         Records the candidates NOT chosen, with their live usage, because that is what
@@ -1469,9 +1490,12 @@ class IdleKVParkManager:
                 # usage is None when a candidate publishes no telemetry; keep it null
                 # rather than substituting the selector's 0.0, so the analysis can tell
                 # "measured idle" from "assumed idle".
+                "need": need,
                 "cand": {str(p.gpu): {"use": usage.get(p.gpu),
                                       "head": p.headroom(),
-                                      "slow": slow_link(p)}
+                                      "slow": slow_link(p),
+                                      # 1 = could not take this park without evicting
+                                      "full": (full(p) if full else None)}
                          for p in self._pools},
             }) + "\n")
         except Exception:  # noqa: BLE001 -- telemetry must never fail a park
@@ -1591,7 +1615,9 @@ class IdleKVParkManager:
                 self._touch_slab(found, fent[0])
             self._skipped_count += 1  # already parked (on some GPU or in CPU DRAM)
             return
-        pool = self._select_pool()  # opportunistic: most-idle GPU, fast link first
+        # `n` matters: the choice is "which pool can take THIS park without evicting",
+        # not "which pool is non-empty".
+        pool = self._select_pool(need=n)  # idlest fast-link GPU that has room
         if pool.session_keyed:
             # This conversation reuses its own slab (found by prefix-supersession),
             # overwritten in place; a new conversation takes a free slab (evict LRU if
