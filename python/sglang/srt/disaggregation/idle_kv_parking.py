@@ -76,6 +76,18 @@ PARK_POOL_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_TOKENS", "200000"))
 # skipped if it exceeds one slab. pool = (N // slab) slabs.
 PARK_SESSION_KEYED = os.environ.get("SGLANG_KV_PARK_SESSION_KEYED", "0") == "1"
 PARK_SLAB_TOKENS = int(os.environ.get("SGLANG_KV_PARK_SLAB_TOKENS", "6000"))
+# Park pools come out of UNALLOCATED HBM, not out of the serving KV pool's free slots.
+# A pool size that does not fit therefore has to shrink, not abort: the size is a tuning
+# knob, and asking for more than the card has left used to raise OutOfMemoryError inside
+# the scheduler constructor and take the whole node down at startup. Leave a margin below
+# the reported free memory for the allocator's own bookkeeping and for the other prefill
+# process racing for the same decode GPU.
+PARK_GPU_RESERVE_GB = float(os.environ.get("SGLANG_KV_PARK_GPU_RESERVE_GB", "1.0"))
+PARK_POOL_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_MIN_TOKENS", "2048"))
+# torch.OutOfMemoryError only exists from 2.5; older builds expose it under torch.cuda.
+# Both subclass RuntimeError, which is the last-resort fallback.
+_OOM_ERROR = (getattr(torch, "OutOfMemoryError", None)
+              or getattr(torch.cuda, "OutOfMemoryError", RuntimeError))
 # N-node rendezvous (Phase 2 slice-2 piece 2): each node publishes its own file so a
 # 2P2D cluster's 4 nodes don't clobber a single rendezvous file. Decode publishes its
 # KV-pool IPC handles (so any prefill can read its KV to copy a park); prefill publishes
@@ -1185,16 +1197,73 @@ class IdleKVParkManager:
                 logger.error("Idle KV parking [prefill]: receive park failed: %r", e)
 
     # --- slice 4 / Phase 2 slice 1: idle-GPU park pools -----------------------
+    def _park_bytes_per_token(self) -> int:
+        k0 = self.k_buffer[0]
+        return 2 * k0.shape[1] * k0.shape[2] * k0.element_size() * len(self.k_buffer)
+
+    def _fit_pool_tokens(self, gpu: int, want: int) -> int:
+        """Largest pool that currently fits on `gpu`, capped at `want`.
+
+        Sized from the live free memory rather than from a configured budget, because the
+        two prefill processes allocate onto the same decode GPUs independently and neither
+        knows what the other has taken. Whoever runs second simply gets the smaller pool
+        instead of dying.
+        """
+        try:
+            free, _total = torch.cuda.mem_get_info(gpu)
+        except Exception:  # noqa: BLE001  -- device unreadable: let the alloc decide
+            return want
+        budget = free - PARK_GPU_RESERVE_GB * 1e9
+        if budget <= 0:
+            return 0
+        return max(0, min(want, int(budget // self._park_bytes_per_token())))
+
     def _init_park_gpu_pool(self) -> None:
-        """Build one park pool per candidate idle GPU (SGLANG_KV_PARK_GPUS)."""
-        N = PARK_POOL_TOKENS
+        """Build one park pool per candidate idle GPU (SGLANG_KV_PARK_GPUS).
+
+        Each pool is clamped to what its GPU can actually hold and, if even that loses a
+        race with the peer prefill, halved until it fits. A GPU with no room is skipped
+        with a warning rather than aborting the node -- losing one park target degrades
+        placement, while raising here would have taken down a 4-node cluster over a knob.
+        """
+        want = PARK_POOL_TOKENS
         for gpu in self.park_gpus:
-            self._pools.append(_ParkPool(gpu, self.k_buffer, N))
+            N = self._fit_pool_tokens(gpu, want)
+            while N >= PARK_POOL_MIN_TOKENS:
+                try:
+                    self._pools.append(_ParkPool(gpu, self.k_buffer, N))
+                    break
+                except _OOM_ERROR:
+                    torch.cuda.empty_cache()
+                    N //= 2
+            else:
+                free_gb = 0.0
+                try:
+                    free_gb = torch.cuda.mem_get_info(gpu)[0] / 1e9
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(
+                    "Idle KV parking [prefill]: SKIPPING park pool on GPU%d -- asked for "
+                    "%d tokens (%.1f GB) but only %.1f GB is free there. Park pools are "
+                    "carved from UNALLOCATED HBM, not from free slots inside the serving "
+                    "KV pool, so lower --mem-fraction-static on that GPU (or lower "
+                    "SGLANG_KV_PARK_POOL_TOKENS) to make room.",
+                    gpu, want, want * self._park_bytes_per_token() / 1e9, free_gb,
+                )
+        if not self._pools:
+            raise RuntimeError(
+                "Idle KV parking [prefill]: no park pool could be allocated on any of "
+                f"GPU{self.park_gpus}. Every candidate is out of unallocated HBM; "
+                "reduce --mem-fraction-static or SGLANG_KV_PARK_POOL_TOKENS."
+            )
+        got = [p.N for p in self._pools]
         total_gb = sum(p.gb for p in self._pools)
         logger.info(
-            "Idle KV parking [prefill]: %d idle-GPU park pool(s) on GPU%s = %d tokens x "
-            "%d layers each (~%.1f GB total). Parking picks the pool with most headroom.",
-            len(self._pools), [p.gpu for p in self._pools], N, len(self.k_buffer), total_gb,
+            "Idle KV parking [prefill]: %d idle-GPU park pool(s) on GPU%s = %s tokens x "
+            "%d layers each (~%.1f GB total)%s. Parking picks the pool with most headroom.",
+            len(self._pools), [p.gpu for p in self._pools], got, len(self.k_buffer),
+            total_gb,
+            "" if all(n == want for n in got) else f" [CLAMPED from {want} to fit]",
         )
 
     def _live_kv_usage(self):
