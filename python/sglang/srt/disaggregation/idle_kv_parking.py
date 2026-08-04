@@ -82,12 +82,17 @@ PARK_SLAB_TOKENS = int(os.environ.get("SGLANG_KV_PARK_SLAB_TOKENS", "6000"))
 # the scheduler constructor and take the whole node down at startup. Leave a margin below
 # the reported free memory for the allocator's own bookkeeping and for the other prefill
 # process racing for the same decode GPU.
-# 4 GB, not 1. A park pool is allocated during Scheduler init, BEFORE CUDA graph capture
-# and before any forward pass, so mem_get_info at that moment still shows memory those
-# stages are going to need. At a 1 GB reserve a prefill node granted 34,485 tokens
-# (clamped down from 40,000) came up, served for ~25 s, and died with 0.93 GiB left on the
-# card -- the allocation was protected but the process was not. Runs that worked left
-# ~2.6 GiB free after parking, so the reserve is set above that.
+# 4 GB, not 1. A park pool is allocated during Scheduler init, BEFORE CUDA graph capture,
+# before any forward pass, and before any peer has IPC-mapped this GPU -- so mem_get_info
+# at that moment cannot see three separate costs still to come:
+#   1. CUDA graph capture and activation workspace
+#   2. ~262 MiB of CUDA context per PEER process that maps this GPU's park pool. In a
+#      2P2D cluster a prefill GPU carried three of them (786 MiB total, measured).
+#   3. transient allocator headroom in the forward pass
+# At a 1 GB reserve a prefill granted 34,485 tokens (correctly clamped down from 40,000)
+# came up, served for ~25 s, and died inside F.linear failing to allocate 20 MiB, with
+# 11.75 MiB free on a 47.40 GiB card. Runs that survived left ~2.6 GB free after parking.
+# Scale this up for clusters with more peers: term 2 grows with the node count.
 PARK_GPU_RESERVE_GB = float(os.environ.get("SGLANG_KV_PARK_GPU_RESERVE_GB", "4.0"))
 PARK_POOL_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_MIN_TOKENS", "2048"))
 # torch.OutOfMemoryError only exists from 2.5; older builds expose it under torch.cuda.
@@ -1271,6 +1276,36 @@ class IdleKVParkManager:
             total_gb,
             "" if all(n == want for n in got) else f" [CLAMPED from {want} to fit]",
         )
+        # What is left on this node's OWN GPU, stated at startup. Everything that goes
+        # wrong here goes wrong later: graph capture, activations, and the ~262 MiB CUDA
+        # context that EACH peer creates on this GPU when it IPC-maps the park pool -- a
+        # cost that does not exist yet at this moment, so mem_get_info cannot see it. A
+        # node that took too much came up clean, served for 25 s, then died inside
+        # F.linear failing to allocate 20 MiB. Say it now instead.
+        try:
+            own_free = torch.cuda.mem_get_info(self.gpu_id)[0] / 1e9
+            # Lower bound on the peer count: every process that IPC-maps this GPU adds a
+            # context, and a node cannot see from here how many will. In the 2P2D run
+            # three foreign contexts landed on a prefill GPU while this estimate said two.
+            n_peers = max(0, len(self.park_gpus) - 1)
+            peer_ctx = 0.28 * n_peers          # measured ~262 MiB per foreign context
+            logger.info(
+                "Idle KV parking [prefill]: GPU%d has %.2f GB unallocated after parking; "
+                "still to come are CUDA graph capture, activations, and at least %.2f GB "
+                "of peer IPC contexts (>=%d peers x ~0.28 GB).",
+                self.gpu_id, own_free, peer_ctx, n_peers,
+            )
+            if own_free - peer_ctx < 1.5:
+                logger.warning(
+                    "Idle KV parking [prefill]: ONLY %.2f GB will remain on GPU%d after "
+                    "peer IPC contexts. Runs that survived left ~2.6 GB. This node is "
+                    "likely to die mid-run with a CUDA OOM in the forward pass. Lower "
+                    "SGLANG_KV_PARK_POOL_TOKENS, or raise "
+                    "SGLANG_KV_PARK_GPU_RESERVE_GB (currently %.1f).",
+                    own_free - peer_ctx, self.gpu_id, PARK_GPU_RESERVE_GB,
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _live_kv_usage(self):
         """This node's live serving KV pool usage fraction [0,1], or None."""
