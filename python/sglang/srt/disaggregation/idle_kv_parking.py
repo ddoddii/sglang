@@ -82,7 +82,13 @@ PARK_SLAB_TOKENS = int(os.environ.get("SGLANG_KV_PARK_SLAB_TOKENS", "6000"))
 # the scheduler constructor and take the whole node down at startup. Leave a margin below
 # the reported free memory for the allocator's own bookkeeping and for the other prefill
 # process racing for the same decode GPU.
-PARK_GPU_RESERVE_GB = float(os.environ.get("SGLANG_KV_PARK_GPU_RESERVE_GB", "1.0"))
+# 4 GB, not 1. A park pool is allocated during Scheduler init, BEFORE CUDA graph capture
+# and before any forward pass, so mem_get_info at that moment still shows memory those
+# stages are going to need. At a 1 GB reserve a prefill node granted 34,485 tokens
+# (clamped down from 40,000) came up, served for ~25 s, and died with 0.93 GiB left on the
+# card -- the allocation was protected but the process was not. Runs that worked left
+# ~2.6 GiB free after parking, so the reserve is set above that.
+PARK_GPU_RESERVE_GB = float(os.environ.get("SGLANG_KV_PARK_GPU_RESERVE_GB", "4.0"))
 PARK_POOL_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_POOL_MIN_TOKENS", "2048"))
 # torch.OutOfMemoryError only exists from 2.5; older builds expose it under torch.cuda.
 # Both subclass RuntimeError, which is the last-resort fallback.
