@@ -183,6 +183,22 @@ HOST_FLUSH_MIN_BYTES = int(
 #
 # The middle row is the one that matters: both arms put the KV in CPU DRAM over the same
 # PCIe bus, so any difference there CANNOT be bandwidth.
+# Park asynchronously: enqueue the copy, record a CUDA event, and publish the index
+# entries on a later scheduler pass once the event fires.
+#
+# The blocking version cost 26.9 s of scheduler-main-thread time on a 512-turn longctx run
+# -- 89.5% of the whole park path and 63% of all park+fetch scheduler time -- while the
+# transfer it was waiting on runs at 19.9 GB/s, i.e. 76% of the PCIe link. The copy was
+# never the inefficiency; waiting for it on the thread that admits requests was.
+#
+# WHAT THE WAIT DID AND DID NOT PROTECT. It did not protect the SOURCE: decode frees its
+# slots right after send() with no ack (see park()), so that race predates this change and
+# is unaffected by it. What it did protect is the DESTINATION -- no fetch, here or in a
+# peer prefill via the shared index, may read a slab still being written. That invariant
+# is kept by deferring the index publish, not by blocking the thread.
+#
+# SGLANG_KV_PARK_ASYNC_PARK=0 restores the blocking behaviour for an A/B.
+PARK_ASYNC = os.environ.get("SGLANG_KV_PARK_ASYNC_PARK", "1") == "1"
 FORCE_HOST = os.environ.get("SGLANG_KV_PARK_FORCE_HOST", "0") == "1"
 if FORCE_HOST:
     HOST_OVERFLOW = True   # the tier under test; refusing to enable it would measure 0
@@ -704,6 +720,12 @@ class IdleKVParkManager:
                                "sync": 0.0, "select": 0.0}
         self._park_bytes = 0
         self._park_n = 0
+        # Parks whose copy is enqueued but not yet known to have landed. Drained on each
+        # scheduler pass; their slabs are reserved but deliberately not yet findable.
+        self._pending_parks = []
+        self._pending_starts = {}      # id(pool) -> {start, ...}, so eviction skips them
+        self._park_pending_peak = 0
+        self._park_publish_lag_ms = 0.0
         self._fetch_src_ms = {}
         self._fetch_src_tok = {}
         self._fetch_src_n = {}
@@ -1256,6 +1278,37 @@ class IdleKVParkManager:
         return g, s
 
     # --- prefill side (slice 3b/3c): drain parked messages on the main thread --
+    def _drain_pending_parks(self) -> None:
+        """Publish parks whose copy has landed. Non-blocking: Event.query() asks, it does
+        not wait, so a park that is still in flight simply stays pending one more pass.
+
+        Order is preserved only within a pool, which is all that matters -- two parks to
+        different pools are independent, and two to the same pool were enqueued on that
+        device's stream in order, so an earlier one cannot still be running when a later
+        one has finished."""
+        if not self._pending_parks:
+            return
+        still = []
+        for e in self._pending_parks:
+            try:
+                done = e["ev"].query()
+            except Exception:  # noqa: BLE001
+                done = True    # cannot query -> publish rather than leak the slab
+            if not done:
+                still.append(e)
+                continue
+            self._park_publish_lag_ms += (time.time() - e["t"]) * 1000.0
+            pend = self._pending_starts.get(id(e["pool"]))
+            if pend is not None:
+                pend.discard(e["start"])
+            try:
+                self._publish_park(e["pool"], e["h"], e["start"], e["n"],
+                                   e["prefix_len"], e["token_ids"], e["ms"])
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Idle KV parking [prefill]: publish park failed: %r", exc)
+        self._pending_parks = still
+        self._park_pending_peak = max(self._park_pending_peak, len(still))
+
     def poll_incoming(self, max_msgs: int = 4) -> None:
         """P: drain up to max_msgs parked prefixes, copy their KV from D over NVLink.
 
@@ -1266,6 +1319,9 @@ class IdleKVParkManager:
         # and verified before we touch them.
         if self.role != "prefill" or not self.peer_ready.is_set():
             return
+        # Before admitting new parks, retire finished ones -- otherwise a slab stays
+        # invisible (and its pool short of headroom) for as long as parks keep arriving.
+        self._drain_pending_parks()
         for _ in range(max_msgs):
             try:
                 msg = self._incoming.get_nowait()
@@ -1481,6 +1537,9 @@ class IdleKVParkManager:
                 "park_phase_ms": {k: round(v, 1)
                                   for k, v in self._park_phase_ms.items()},
                 "park_bytes_moved": self._park_bytes,
+                "park_async": 1 if PARK_ASYNC else 0,
+                "park_pending_peak": self._park_pending_peak,
+                "park_publish_lag_ms": round(self._park_publish_lag_ms, 1),
                 "park_n": self._park_n,
                 "fetch_src_ms": {k: round(v, 1) for k, v in self._fetch_src_ms.items()},
                 "fetch_src_tok": dict(self._fetch_src_tok),
@@ -1781,7 +1840,14 @@ class IdleKVParkManager:
         if not pool.blocks:
             return
         now = time.time()
-        base = min(pool.blocks, key=lambda b: _reuse_value(
+        # Never give up a slab whose copy is still in flight: it is not in pool.blocks yet
+        # under the session-keyed layout, but be explicit rather than relying on that, so
+        # a later change to when blocks are recorded cannot turn into silent corruption.
+        pend = self._pending_starts.get(id(pool)) or set()
+        cand = [b for b in pool.blocks if b not in pend]
+        if not cand:
+            return
+        base = min(cand, key=lambda b: _reuse_value(
             pool.blocks[b][0], pool.blocks[b][2], now))
         self._dropped_tokens += pool.blocks[base][0]
         self._clear_slab_index(pool, base)
@@ -1846,12 +1912,22 @@ class IdleKVParkManager:
             t_x += c - b
             t_w += d - c
         a = time.perf_counter()
-        torch.cuda.synchronize(pool.gpu)
+        ev = None
+        if PARK_ASYNC:
+            # Record instead of wait. The event is checked on a later scheduler pass, so
+            # the copy overlaps the forward pass rather than stalling request handling.
+            # Recorded on the PARK device's current stream, after that device's writes.
+            with torch.cuda.device(pool.gpu):
+                ev = torch.cuda.Event()
+                ev.record()
+        else:
+            torch.cuda.synchronize(pool.gpu)
         t_s = time.perf_counter() - a
         for k, v in (("index", t_idx), ("gather", t_g), ("xfer", t_x), ("write", t_w),
                      ("sync", t_s)):
             self._park_phase_ms[k] += v * 1000.0
         self._park_bytes += n * self._bytes_per_token()
+        return ev
 
     def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0,
                      src_gpu: int = -1) -> None:
@@ -1926,6 +2002,13 @@ class IdleKVParkManager:
             if start + n > pool.N:
                 start = 0  # wrap
             end = start + n
+            # Reserve the range NOW, not at publish time. Under async parking the publish
+            # happens a scheduler pass or more later, so leaving pool.next unadvanced
+            # would hand the identical offset to the next park and have two in-flight
+            # copies write the same slots. The ring is the DEFAULT layout
+            # (SGLANG_KV_PARK_SESSION_KEYED=0), so this is the common path, and the
+            # session-keyed path is already safe because slab_alloc pops the slab here.
+            pool.next = end % pool.N
             for k in list(pool.index.keys()):  # ring: evict index entries the write overlaps
                 s0, ln = pool.index[k]
                 if not (s0 + ln <= start or s0 >= end):
@@ -1936,8 +2019,30 @@ class IdleKVParkManager:
                     if self._shared_index is not None:
                         self._shared_index.remove(k)
         t0 = time.perf_counter()
-        self._gather_copy_peer_to_park(pool, src_k, src_v, src_indices, start, n)
+        ev = self._gather_copy_peer_to_park(pool, src_k, src_v, src_indices, start, n)
         ms = (time.perf_counter() - t0) * 1000.0
+        if ev is not None:
+            # ASYNC PARK. The copy is enqueued and NOT waited for; the index entries that
+            # would make this slab findable are held back until the event says the bytes
+            # landed. Publishing them now would let a fetch -- in this process or, via the
+            # shared index, in a peer prefill -- read a slab that is still being written.
+            #
+            # The slab itself is already reserved (slab_alloc / pool.next advanced above),
+            # so nothing else can claim it; only its VISIBILITY is deferred. Eviction is
+            # told to skip it via _pending_starts.
+            self._pending_parks.append({
+                "ev": ev, "pool": pool, "h": h, "start": start, "n": n,
+                "prefix_len": prefix_len, "token_ids": token_ids, "ms": ms,
+                "t": time.time(),
+            })
+            self._pending_starts.setdefault(id(pool), set()).add(start)
+            return
+        self._publish_park(pool, h, start, n, prefix_len, token_ids, ms)
+
+    def _publish_park(self, pool, h, start, n, prefix_len, token_ids, ms) -> None:
+        """Make a parked slab findable. Split out of _park_to_gpu so the blocking and the
+        event-deferred paths cannot drift apart -- this is the step that must not run
+        before the copy has landed."""
         hashes = [h]
         pool.index[h] = (start, n)
         pool.lens[n] += 1
@@ -1957,8 +2062,8 @@ class IdleKVParkManager:
         if pool.session_keyed:
             pool.blocks[start] = (n, hashes, time.time())
             pool.blocks.move_to_end(start)  # MRU
-        else:
-            pool.next = (start + n) % pool.N
+        # The ring's pool.next was advanced when the range was reserved in _park_to_gpu,
+        # not here -- advancing it at publish would let two in-flight parks share slots.
         self._copied_count += 1
         self._n_sum += n
         # Count tokens parked onto a GPU pool too. This was only incremented on the
@@ -2137,6 +2242,10 @@ class IdleKVParkManager:
         thread (allocator-safe). Park-GPU mode only (slice 4b)."""
         if self.role != "prefill" or not self._pools:
             return 0
+        # Retire landed parks first. A prefix parked one pass ago is findable only after
+        # its publish, so skipping this would report a miss for KV that is already resident
+        # and would understate the hit rate by exactly the publish lag.
+        self._drain_pending_parks()
         try:
             token_ids = list(getattr(req, "origin_input_ids", None) or [])
         except Exception:  # noqa: BLE001
