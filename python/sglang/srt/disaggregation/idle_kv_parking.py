@@ -197,6 +197,12 @@ if FORCE_HOST:
 # fit of it is meaningless. Traces record the sync flag per row and the analysis refuses
 # to fit async rows. Run the cost-model arm with SGLANG_KV_PARK_SYNC_FETCH=1.
 FETCH_TRACE_DIR = os.environ.get("SGLANG_KV_PARK_FETCH_TRACE", "")
+# Column order for the per-fetch phase breakdown. copy_to and copy_scatter split the two
+# halves of the per-layer copy: copy_to allocates a temporary on the local device for
+# every one of the 64 layer-slices, so an allocator stall under KV-pool pressure lands
+# there rather than in the kernel launch it is easily mistaken for.
+_PHASES = ("find", "match", "alloc", "evict", "copy_to", "copy_scatter", "copy_sync",
+           "insert")
 
 # --- Phase 3: reuse value (what to give up first) ------------------------------------
 # Plain LRU throws away whichever block was touched longest ago, which ignores the one
@@ -680,6 +686,17 @@ class IdleKVParkManager:
         self._fetch_ms_tier = {"local": 0.0, "peer": 0.0, "host": 0.0}
         self._fetch_tok_tier = {"local": 0, "peer": 0, "host": 0}
         self._fetch_n_tier = {"local": 0, "peer": 0, "host": 0}
+        # Where the scheduler-thread time in a fetch actually goes. The copy was the only
+        # timed phase, and it read ~80 ms on the async path -- far too high for a pure
+        # enqueue -- so the alternatives (index scan, radix match, allocation, and
+        # evict-to-room on a full pool) have to be separable from it and from each other.
+        self._fetch_phase_ms = {"find": 0.0, "match": 0.0, "alloc": 0.0, "evict": 0.0,
+                                "copy_to": 0.0, "copy_scatter": 0.0, "copy_sync": 0.0,
+                                "insert": 0.0}
+        self._miss_find_ms_sum = 0.0   # index scans that found nothing: pure overhead
+        self._last_copy_to_ms = 0.0
+        self._last_copy_scatter_ms = 0.0
+        self._last_copy_sync_ms = 0.0
         self._trace_fh = None       # opened lazily; see _trace_fetch
         # Residency accounting for the placement figure: tokens this process DESTROYED,
         # i.e. KV that no longer exists in any tier and would have to be re-prefilled.
@@ -1421,6 +1438,9 @@ class IdleKVParkManager:
                 # with KV BYTES (800 KiB/token on an MHA model vs 128 on a GQA one)
                 # while the saving scales with TOKENS, so the two can invert.
                 "fetch_ms_sum": round(self._fetch_ms_sum, 1),
+                "fetch_phase_ms": {k: round(v, 1)
+                                   for k, v in self._fetch_phase_ms.items()},
+                "miss_find_ms_sum": round(self._miss_find_ms_sum, 1),
                 # Per-tier cost, so "why is it faster" is answerable from a run rather
                 # than from a microbenchmark: ms/token per tier is
                 # fetch_ms_tier[t] / fetch_tok_tier[t].
@@ -1973,13 +1993,37 @@ class IdleKVParkManager:
         it before the model read); the source was synchronized at park time."""
         local_dev = f"cuda:{self.gpu_id}"
         lo, hi = park_start + existing, park_start + n
+        # Split the two halves of each layer's work. On the ASYNC path this loop measured
+        # ~80 ms per fetch, which is impossible for pure enqueue and is the number that
+        # decided the longctx result -- so it has to be attributable, not just totalled.
+        #   to_ms       peer-GPU slice -> local tensor. Allocates a temporary on the local
+        #               device every layer (64 per fetch). Under KV-pool pressure the
+        #               caching allocator can block the host thread here to free blocks,
+        #               which would be an allocator stall wearing a transfer's clothes.
+        #   scatter_ms  indexed write into the KV pool (index_put), a real kernel launch.
+        # If to_ms dominates, the cost is allocation, not the link -- and that is fixable.
+        t_to = t_sc = 0.0
         for layer in range(len(self.k_buffer)):
-            self.k_buffer[layer][dst_idx] = src_k[layer][lo:hi].to(local_dev)
-            self.v_buffer[layer][dst_idx] = src_v[layer][lo:hi].to(local_dev)
+            a = time.perf_counter()
+            tk = src_k[layer][lo:hi].to(local_dev)
+            tv = src_v[layer][lo:hi].to(local_dev)
+            b = time.perf_counter()
+            self.k_buffer[layer][dst_idx] = tk
+            self.v_buffer[layer][dst_idx] = tv
+            c = time.perf_counter()
+            t_to += b - a
+            t_sc += c - b
+        self._last_copy_to_ms = t_to * 1000.0
+        self._last_copy_scatter_ms = t_sc * 1000.0
         if self.sync_fetch:
+            s = time.perf_counter()
             torch.cuda.synchronize(self.gpu_id)
+            self._last_copy_sync_ms = (time.perf_counter() - s) * 1000.0
+        else:
+            self._last_copy_sync_ms = 0.0
 
-    def _trace_fetch(self, tier: str, tokens: int, ms: float, src_gpu: int) -> None:
+    def _trace_fetch(self, tier: str, tokens: int, ms: float, src_gpu: int,
+                     phases: dict | None = None) -> None:
         """Append one row to the per-fetch cost trace (no-op unless enabled).
 
         `sync` is recorded per row and not per file because SYNC_FETCH is read at
@@ -1994,11 +2038,14 @@ class IdleKVParkManager:
                 new = not os.path.exists(path) or os.path.getsize(path) == 0
                 self._trace_fh = open(path, "a", buffering=1)
                 if new:
-                    self._trace_fh.write("ts,tier,src_gpu,tokens,bytes,ms,sync\n")
+                    self._trace_fh.write(
+                        "ts,tier,src_gpu,tokens,bytes,ms,sync," + ",".join(_PHASES) + "\n")
+            ph = phases or {}
             self._trace_fh.write(
                 f"{time.time():.3f},{tier},{src_gpu},{tokens},"
                 f"{tokens * self._bytes_per_token()},{ms:.3f},"
-                f"{1 if self.sync_fetch else 0}\n")
+                f"{1 if self.sync_fetch else 0}," +
+                ",".join(f"{ph.get(k, 0.0):.3f}" for k in _PHASES) + "\n")
         except Exception:  # noqa: BLE001
             pass
 
@@ -2015,9 +2062,12 @@ class IdleKVParkManager:
             return 0
         if not token_ids:
             return 0
+        _t_find = time.perf_counter()
         hit = self._find_fetch_source(token_ids)
+        _ms_find = (time.perf_counter() - _t_find) * 1000.0
         if hit is None:
             self._fetch_miss += 1
+            self._miss_find_ms_sum += _ms_find   # a miss still pays the index scan
             return 0
         src_k, src_v, start, n, src_gpu = hit
         is_cross = src_gpu in self.peer_park_pools  # parked by a PEER prefill
@@ -2025,21 +2075,28 @@ class IdleKVParkManager:
         if is_host:
             self._fetch_host_hits += 1
         key = RadixKey(token_ids[:n], extra_key=None)
+        _t = time.perf_counter()
         existing = len(self.tree_cache.match_prefix(key).device_indices)
+        _ms_match = (time.perf_counter() - _t) * 1000.0
         if existing >= n:
             self._fetch_already += 1  # P still has it (natural hit); nothing to stage
             return 0
+        _ms_evict = 0.0
+        _t = time.perf_counter()
         dst = self.token_to_kv_pool_allocator.alloc(n)
+        _ms_alloc = (time.perf_counter() - _t) * 1000.0
         if dst is None:
             # evict-to-room (like hicache): the P GPU pool is full, but the cold
             # entries we evict are safe -- their KV is still in the park pool (or
             # cheaply recomputable). LRU-evict enough to stage this (hotter) prefix,
             # then retry. This is exactly what the scheduler does under pressure.
+            _t = time.perf_counter()
             try:
                 self.tree_cache.evict(n)
             except Exception as e:  # noqa: BLE001
                 logger.debug("Idle KV parking [prefill]: evict-to-room failed: %r", e)
             dst = self.token_to_kv_pool_allocator.alloc(n)
+            _ms_evict = (time.perf_counter() - _t) * 1000.0
             if dst is None:
                 self._fetch_nospace += 1  # still no room even after eviction
                 return 0
@@ -2061,7 +2118,9 @@ class IdleKVParkManager:
             # Pass the GPU slot view directly -- no GPU->CPU->GPU round-trip (see helper).
             self._gather_copy_park_to_local(src_k, src_v, start, existing, n, dst64[existing:n])
             ms = (time.perf_counter() - t0) * 1000.0
+            _t = time.perf_counter()
             new_prefix_len = self.tree_cache.insert(key, dst64)
+            _ms_insert = (time.perf_counter() - _t) * 1000.0
             inserted_into_tree = True  # tree now owns dst64[new_prefix_len:]
             if new_prefix_len > 0:
                 self.token_to_kv_pool_allocator.free(dst64[:new_prefix_len])
@@ -2082,7 +2141,16 @@ class IdleKVParkManager:
         self._fetch_ms_tier[tier] += ms
         self._fetch_tok_tier[tier] += fetched
         self._fetch_n_tier[tier] += 1
-        self._trace_fetch(tier, fetched, ms, src_gpu)
+        # Phase breakdown of the whole scheduler-thread cost, not just the copy. `ms`
+        # above covers only _gather_copy_park_to_local; find/match/alloc/evict/insert are
+        # also serial on this thread and also block every other request in the batch.
+        ph = {"find": _ms_find, "match": _ms_match, "alloc": _ms_alloc,
+              "evict": _ms_evict, "copy_to": self._last_copy_to_ms,
+              "copy_scatter": self._last_copy_scatter_ms,
+              "copy_sync": self._last_copy_sync_ms, "insert": _ms_insert}
+        for k, v in ph.items():
+            self._fetch_phase_ms[k] += v
+        self._trace_fetch(tier, fetched, ms, src_gpu, ph)
         if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
             logger.info(
                 "Idle KV parking [prefill gpu%s]-fetch: rid=%s pulled %d tok "
