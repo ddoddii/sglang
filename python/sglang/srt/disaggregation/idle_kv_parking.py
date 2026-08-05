@@ -167,6 +167,37 @@ HOST_FLUSH_MIN_BYTES = int(
     float(os.environ.get("SGLANG_KV_PARK_HOST_FLUSH_MIN_GB", "1")) * 2**30
 )
 
+# --- ablation: send every park to CPU DRAM instead of an idle GPU ---------------------
+# THE ONLY REASON THIS EXISTS is to answer "is the gain the LINK, or the POLICY?".
+#
+# Comparing our GPU parking against hicache moves three things at once -- placement
+# policy, transfer software, and storage medium -- so a win over hicache cannot say which
+# one paid. FORCE_HOST holds the first two fixed and moves only the third: same index,
+# same eviction, same reuse-value ranking, same fetch code, same GPU park pool still
+# ALLOCATED (so HBM footprint is unchanged and the two arms are memory-matched) -- but
+# every park lands in pinned host DRAM over PCIe instead of on a peer GPU.
+#
+#   park_gpu  vs  park_host    -> medium only              (link)
+#   park_host vs  hicache      -> same medium, both DRAM   (transfer software)
+#   park_gpu  vs  radix        -> total gain
+#
+# The middle row is the one that matters: both arms put the KV in CPU DRAM over the same
+# PCIe bus, so any difference there CANNOT be bandwidth.
+FORCE_HOST = os.environ.get("SGLANG_KV_PARK_FORCE_HOST", "0") == "1"
+if FORCE_HOST:
+    HOST_OVERFLOW = True   # the tier under test; refusing to enable it would measure 0
+
+# Per-fetch trace: one CSV row per satisfied fetch (tier, tokens, bytes, ms), so the
+# cost of a tier can be REGRESSED rather than assumed -- ms = intercept + bytes/BW.
+# The intercept is per-call software overhead, the slope is the link. Those are exactly
+# the two hypotheses, and only a trace can separate them.
+#
+# READ THIS BEFORE FITTING: with SGLANG_KV_PARK_SYNC_FETCH=0 (the default) the copy is
+# enqueued and not awaited, so the recorded ms is ENQUEUE time, not transfer time, and a
+# fit of it is meaningless. Traces record the sync flag per row and the analysis refuses
+# to fit async rows. Run the cost-model arm with SGLANG_KV_PARK_SYNC_FETCH=1.
+FETCH_TRACE_DIR = os.environ.get("SGLANG_KV_PARK_FETCH_TRACE", "")
+
 # --- Phase 3: reuse value (what to give up first) ------------------------------------
 # Plain LRU throws away whichever block was touched longest ago, which ignores the one
 # thing that actually differs between parked prefixes: how expensive they are to get
@@ -642,6 +673,14 @@ class IdleKVParkManager:
         self._fetch_nospace = 0     # KV pool full even after evict-to-room (gave up)
         self._fetch_evicted = 0     # had to LRU-evict cold entries to make room (like hicache)
         self._fetch_ms_sum = 0.0
+        # Per-tier fetch cost. The aggregate above cannot answer "is the GPU link why
+        # this is faster" -- a run that fetches mostly from the local pool and a run that
+        # fetches mostly over PCIe both collapse into one number. Split by where the
+        # bytes came from, and carry the token count so ms/token is derivable per tier.
+        self._fetch_ms_tier = {"local": 0.0, "peer": 0.0, "host": 0.0}
+        self._fetch_tok_tier = {"local": 0, "peer": 0, "host": 0}
+        self._fetch_n_tier = {"local": 0, "peer": 0, "host": 0}
+        self._trace_fh = None       # opened lazily; see _trace_fetch
         # Residency accounting for the placement figure: tokens this process DESTROYED,
         # i.e. KV that no longer exists in any tier and would have to be re-prefilled.
         # Counted separately from host-tier evictions (self._host.evicted_bytes) because
@@ -1382,6 +1421,15 @@ class IdleKVParkManager:
                 # with KV BYTES (800 KiB/token on an MHA model vs 128 on a GQA one)
                 # while the saving scales with TOKENS, so the two can invert.
                 "fetch_ms_sum": round(self._fetch_ms_sum, 1),
+                # Per-tier cost, so "why is it faster" is answerable from a run rather
+                # than from a microbenchmark: ms/token per tier is
+                # fetch_ms_tier[t] / fetch_tok_tier[t].
+                "fetch_ms_tier": {k: round(v, 1)
+                                  for k, v in self._fetch_ms_tier.items()},
+                "fetch_tok_tier": dict(self._fetch_tok_tier),
+                "fetch_n_tier": dict(self._fetch_n_tier),
+                "sync_fetch": 1 if self.sync_fetch else 0,
+                "force_host": 1 if FORCE_HOST else 0,
                 "fetch_already": self._fetch_already,
                 "fetch_nospace": self._fetch_nospace,
                 "fetched_tokens": self._fetched_tokens,
@@ -1734,6 +1782,15 @@ class IdleKVParkManager:
                 self._touch_slab(found, fent[0])
             self._skipped_count += 1  # already parked (on some GPU or in CPU DRAM)
             return
+        if FORCE_HOST:
+            # Ablation arm: identical index, policy, ranking and fetch code -- only the
+            # medium moves. Reached AFTER the already-parked check above so the dedup
+            # behaviour is the same as the GPU arm too. The GPU pool stays allocated and
+            # simply unused, which is deliberate: it keeps HBM footprint matched, so a
+            # TTFT difference between the arms cannot be blamed on memory pressure.
+            self._park_to_host(token_ids, src_k, src_v, src_indices, n, prefix_len,
+                               src_gpu)
+            return
         # `n` matters: the choice is "which pool can take THIS park without evicting",
         # not "which pool is non-empty".
         pool = self._select_pool(need=n)  # idlest fast-link GPU that has room
@@ -1916,6 +1973,29 @@ class IdleKVParkManager:
         if self.sync_fetch:
             torch.cuda.synchronize(self.gpu_id)
 
+    def _trace_fetch(self, tier: str, tokens: int, ms: float, src_gpu: int) -> None:
+        """Append one row to the per-fetch cost trace (no-op unless enabled).
+
+        `sync` is recorded per row and not per file because SYNC_FETCH is read at
+        construction: a trace that silently mixed enqueue times with transfer times
+        would fit a bandwidth of several TB/s and look like a discovery."""
+        if not FETCH_TRACE_DIR:
+            return
+        try:
+            if self._trace_fh is None:
+                os.makedirs(FETCH_TRACE_DIR, exist_ok=True)
+                path = os.path.join(FETCH_TRACE_DIR, f"fetch_gpu{self.gpu_id}.csv")
+                new = not os.path.exists(path) or os.path.getsize(path) == 0
+                self._trace_fh = open(path, "a", buffering=1)
+                if new:
+                    self._trace_fh.write("ts,tier,src_gpu,tokens,bytes,ms,sync\n")
+            self._trace_fh.write(
+                f"{time.time():.3f},{tier},{src_gpu},{tokens},"
+                f"{tokens * self._bytes_per_token()},{ms:.3f},"
+                f"{1 if self.sync_fetch else 0}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
     def maybe_fetch(self, req: "Req") -> int:
         """P: before a request enters prefill, pull its parked prefix from an idle-GPU
         pool back into the local KV pool + radix, so the scheduler prefix-hits instead
@@ -1989,6 +2069,14 @@ class IdleKVParkManager:
         self._fetch_ms_sum += ms
         if is_cross:
             self._fetch_cross_hits += 1
+        # Charge the cost to the tier that served it. `fetched` (not n) is the number of
+        # tokens actually copied, so ms/token stays comparable across tiers even when the
+        # local radix already held part of the prefix.
+        tier = "host" if is_host else ("peer" if is_cross else "local")
+        self._fetch_ms_tier[tier] += ms
+        self._fetch_tok_tier[tier] += fetched
+        self._fetch_n_tier[tier] += 1
+        self._trace_fetch(tier, fetched, ms, src_gpu)
         if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
             logger.info(
                 "Idle KV parking [prefill gpu%s]-fetch: rid=%s pulled %d tok "
