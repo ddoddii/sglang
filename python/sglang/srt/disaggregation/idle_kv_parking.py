@@ -1553,6 +1553,7 @@ class IdleKVParkManager:
                                           os.getpid(), 0, prefix_len, loc=LOC_HOST)
         self._copied_count += 1
         self._n_sum += n
+        self._parked_tokens += n     # host tier counts as parked too (see _park_to_gpu)
         self._recent_parked.append((h, n))
         if store.n_parked <= 5 or store.n_parked % 50 == 0:
             logger.info("Idle KV parking [host]: %d tok x %d layers in %.1fms | %s",
@@ -1860,6 +1861,11 @@ class IdleKVParkManager:
             pool.next = (start + n) % pool.N
         self._copied_count += 1
         self._n_sum += n
+        # Count tokens parked onto a GPU pool too. This was only incremented on the
+        # P-radix path, so park-pool runs published "parked_tokens: 0" beside
+        # "fetched_tokens: 985319" -- a telemetry line that contradicts itself and makes
+        # the whole record look untrustworthy.
+        self._parked_tokens += n
         self._recent_parked.append((h, n))  # dense: reflects the next-turn window
         if self._parked_count <= 5 or self._copied_count % 50 == 0:
             self._parked_count += 1
