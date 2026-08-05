@@ -770,6 +770,13 @@ class IdleKVParkManager:
         self._admit_skipped = 0
         self._admit_skipped_tokens = 0
         self._admit_F = 0.0
+        # Host-tier park cost, split so the comparison against the GPU tier is mechanistic
+        # rather than a single number: alloc is the pinning the GPU path never pays.
+        self._host_phase_ms = {"alloc": 0.0, "copy": 0.0, "sync": 0.0}
+        self._host_bytes = 0
+        self._host_n = 0
+        self._host_cold_pins = 0        # allocations slow enough to be a real pin
+        self._host_cold_pin_ms = 0.0
         self._pending_parks = []
         self._pending_starts = {}      # id(pool) -> {start, ...}, so eviction skips them
         self._park_pending_peak = 0
@@ -1588,6 +1595,12 @@ class IdleKVParkManager:
                                   for k, v in self._park_phase_ms.items()},
                 "park_bytes_moved": self._park_bytes,
                 "park_async": 1 if PARK_ASYNC else 0,
+                "host_phase_ms": {k: round(v, 1)
+                                  for k, v in self._host_phase_ms.items()},
+                "host_bytes_moved": self._host_bytes,
+                "host_park_n": self._host_n,
+                "host_cold_pins": self._host_cold_pins,
+                "host_cold_pin_ms": round(self._host_cold_pin_ms, 1),
                 "admit_skipped": self._admit_skipped,
                 "admit_skipped_tokens": self._admit_skipped_tokens,
                 "admit_F": round(self._admit_F, 2),
@@ -1697,7 +1710,21 @@ class IdleKVParkManager:
         store = self._host_store()
         if store is None:
             return False
+        # TIME THE ALLOCATION SEPARATELY. This is the whole reason the host tier can lose
+        # to a peer GPU by more than bandwidth explains. A GPU park pool is allocated once
+        # at startup and reused forever, so a park there is pure DMA. Host memory has to be
+        # PINNED before it can be a DMA target, and pinning is a kernel operation measured
+        # at ~480-640 ms/GiB on this box (see HOST_BUCKET_TOKENS). Bucketing lets PyTorch's
+        # caching host allocator reuse a same-sized block, so the cost lands on the FIRST
+        # park of each size class and on any park that follows an eviction+flush -- which
+        # is invisible in an average and is exactly what has to be shown, not asserted.
+        _t = time.perf_counter()
         blk = store.alloc(n)
+        _ms_alloc = (time.perf_counter() - _t) * 1000.0
+        self._host_phase_ms["alloc"] += _ms_alloc
+        if _ms_alloc > 5.0:
+            self._host_cold_pins += 1
+            self._host_cold_pin_ms += _ms_alloc
         if blk is None:
             return False
         h = _prefix_hash(token_ids, n)
@@ -1708,7 +1735,12 @@ class IdleKVParkManager:
         for layer in range(L):
             blk.t[layer][:n].copy_(src_k[layer][src_indices], non_blocking=True)
             blk.t[L + layer][:n].copy_(src_v[layer][src_indices], non_blocking=True)
+        _t = time.perf_counter()
+        self._host_phase_ms["copy"] += (_t - t0) * 1000.0
         torch.cuda.synchronize(src_gpu if src_gpu >= 0 else self.gpu_id)
+        self._host_phase_ms["sync"] += (time.perf_counter() - _t) * 1000.0
+        self._host_bytes += n * self._bytes_per_token()
+        self._host_n += 1
         ms = (time.perf_counter() - t0) * 1000.0
 
         store.put(h, blk, n)
