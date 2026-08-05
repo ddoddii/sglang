@@ -694,6 +694,13 @@ class IdleKVParkManager:
                                 "copy_to": 0.0, "copy_scatter": 0.0, "copy_sync": 0.0,
                                 "insert": 0.0}
         self._miss_find_ms_sum = 0.0   # index scans that found nothing: pure overhead
+        # Per SOURCE GPU, not just per tier. "peer" lumps together an NVLink-bridged
+        # neighbour and a PCIe-only one, and on this box the park candidates span both
+        # (NVLink pairs are (0,1) and (2,3)). Achieved bandwidth per source is the only
+        # way to tell a slow link from a slow copy implementation.
+        self._fetch_src_ms = {}
+        self._fetch_src_tok = {}
+        self._fetch_src_n = {}
         self._last_copy_to_ms = 0.0
         self._last_copy_scatter_ms = 0.0
         self._last_copy_sync_ms = 0.0
@@ -1323,6 +1330,30 @@ class IdleKVParkManager:
                 f"GPU{self.park_gpus}. Every candidate is out of unallocated HBM; "
                 "reduce --mem-fraction-static or SGLANG_KV_PARK_POOL_TOKENS."
             )
+        # Is peer access actually ON for each park target? This decides what "GPU parking"
+        # even means. Without P2P, a cross-device copy in PyTorch is STAGED THROUGH HOST --
+        # the fetch becomes a GPU->host->GPU round trip while still being reported as a
+        # peer-GPU hit, and the premise of the design is quietly false. The measured fetch
+        # path runs at 10.2 GB/s against a 52.7 GB/s peer ceiling, which is exactly what a
+        # staged copy would look like, so this must be visible at startup rather than
+        # inferred from a bandwidth number after the fact.
+        for p in self._pools:
+            try:
+                ok = (p.gpu == self.gpu_id
+                      or torch.cuda.can_device_access_peer(self.gpu_id, p.gpu))
+            except Exception:  # noqa: BLE001
+                ok = None
+            if ok is False:
+                logger.warning(
+                    "Idle KV parking [prefill]: NO P2P from GPU%d to park GPU%d. Fetches "
+                    "from that pool are staged through host memory by PyTorch, so they "
+                    "are a GPU->host->GPU round trip, not a peer copy.",
+                    self.gpu_id, p.gpu)
+            else:
+                logger.info("Idle KV parking [prefill]: GPU%d -> park GPU%d peer access "
+                            "%s", self.gpu_id, p.gpu,
+                            "local" if p.gpu == self.gpu_id else
+                            ("ENABLED" if ok else "UNKNOWN"))
         got = [p.N for p in self._pools]
         total_gb = sum(p.gb for p in self._pools)
         logger.info(
@@ -1441,6 +1472,9 @@ class IdleKVParkManager:
                 "fetch_phase_ms": {k: round(v, 1)
                                    for k, v in self._fetch_phase_ms.items()},
                 "miss_find_ms_sum": round(self._miss_find_ms_sum, 1),
+                "fetch_src_ms": {k: round(v, 1) for k, v in self._fetch_src_ms.items()},
+                "fetch_src_tok": dict(self._fetch_src_tok),
+                "fetch_src_n": dict(self._fetch_src_n),
                 # Per-tier cost, so "why is it faster" is answerable from a run rather
                 # than from a microbenchmark: ms/token per tier is
                 # fetch_ms_tier[t] / fetch_tok_tier[t].
@@ -2150,6 +2184,10 @@ class IdleKVParkManager:
               "copy_sync": self._last_copy_sync_ms, "insert": _ms_insert}
         for k, v in ph.items():
             self._fetch_phase_ms[k] += v
+        g = str(src_gpu)
+        self._fetch_src_ms[g] = self._fetch_src_ms.get(g, 0.0) + ms
+        self._fetch_src_tok[g] = self._fetch_src_tok.get(g, 0) + fetched
+        self._fetch_src_n[g] = self._fetch_src_n.get(g, 0) + 1
         self._trace_fetch(tier, fetched, ms, src_gpu, ph)
         if self._fetch_hits <= 5 or self._fetch_hits % 50 == 0:
             logger.info(
