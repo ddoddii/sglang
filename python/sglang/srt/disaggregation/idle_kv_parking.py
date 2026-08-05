@@ -22,6 +22,7 @@ without CUDA_VISIBLE_DEVICES isolation and place them with --base-gpu-id instead
 otherwise _new_shared_cuda cannot open a handle for an invisible device.
 """
 
+import collections
 import json
 import logging
 import os
