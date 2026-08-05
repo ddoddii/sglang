@@ -27,6 +27,7 @@ import logging
 import os
 import pickle
 import queue
+import statistics
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -199,6 +200,43 @@ HOST_FLUSH_MIN_BYTES = int(
 #
 # SGLANG_KV_PARK_ASYNC_PARK=0 restores the blocking behaviour for an A/B.
 PARK_ASYNC = os.environ.get("SGLANG_KV_PARK_ASYNC_PARK", "1") == "1"
+
+# --- admission: park less, so that what IS parked survives long enough to be used ------
+# The measured waste is not "parking sessions that never come back". With four turns per
+# session, turn N's park is read by turn N+1, so only the last turn is inherently wasted --
+# 25%, nowhere near the observed 5.7:1. The real cause is eviction before reuse:
+#
+#   4,381,617 tokens parked through 192,000 tokens of pool  = 23x overwrite
+#   park rate 6,444 tok/s against 96,000 tokens per prefill = a slab lives ~14.9 s
+#   session turn gap (TTFT 7 + decode 0.4 + think 3)        = ~10.4 s
+#
+# 14.9 against 10.4 is marginal, which is exactly why the hit rate sits at 31-46%: roughly
+# half of everything parked is overwritten just before it would have paid.
+#
+# So admission is self-reinforcing in the right direction. Skipping a park lowers the rate,
+# which lengthens survival for everything else -- park less and what remains lives longer.
+# The rule: when the pool is oversubscribed by a factor F, admit only the longest 1/F of
+# recent parks. Length is the right key because re-prefill cost is superlinear in it, so a
+# long prefix is worth disproportionately more per byte parked than a short one.
+#
+# IT SETTLES AT THE SQUARE ROOT OF THE OVERSUBSCRIPTION, not at 1, and that follows from
+# the loop rather than from tuning: admitted = offered / F while F = admitted * gap / N,
+# so the fixed point is F^2 = offered * gap / N. Simulated against the measured park-size
+# distribution, closed-loop F tracks sqrt(open-loop F) to within 9% across a 20-45 s range
+# of assumed gaps. So a pool 4x oversubscribed ends up 2x oversubscribed, not 1x -- the
+# rule halves the exponent, it does not eliminate the problem, and a pool that is badly
+# undersized still needs to be made bigger.
+#
+# WHETHER IT DOES ANYTHING AT ALL depends on that gap. At the currently measured park rate
+# and pool size, F is 0.78 with a 12 s gap, so the rule admits everything and this whole
+# mechanism is a no-op. It only engages if the true reuse gap turns out to be much longer
+# than 12 s -- which is exactly what the hit-age instrumentation added alongside it
+# measures. Do not assume it is reducing park volume; read admit_skipped_tokens.
+PARK_ADMIT = os.environ.get("SGLANG_KV_PARK_ADMIT", "1") == "1"
+# Prior for the reuse gap, used only until enough hits have been observed to measure it.
+PARK_REUSE_GAP_S = float(os.environ.get("SGLANG_KV_PARK_REUSE_GAP_S", "12"))
+# Below this many observed hits the measured gap is not trusted and the prior is used.
+PARK_GAP_MIN_SAMPLES = int(os.environ.get("SGLANG_KV_PARK_GAP_MIN_SAMPLES", "20"))
 FORCE_HOST = os.environ.get("SGLANG_KV_PARK_FORCE_HOST", "0") == "1"
 if FORCE_HOST:
     HOST_OVERFLOW = True   # the tier under test; refusing to enable it would measure 0
@@ -723,6 +761,15 @@ class IdleKVParkManager:
         # Parks whose copy is enqueued but not yet known to have landed. Drained on each
         # scheduler pass; their slabs are reserved but deliberately not yet findable.
         self._idx_free = []            # pinned index-staging buffers, see _upload_indices
+        # Admission control (see PARK_ADMIT): recent (t, n_tokens) parks, observed ages at
+        # hit, and what admission turned away.
+        self._park_window = collections.deque()   # ADMITTED parks: drives the rate
+        self._offered = collections.deque()       # ALL parks: drives the length threshold
+        self._hit_ages = collections.deque(maxlen=256)
+        self._park_time = collections.OrderedDict()   # hash -> park time, bounded
+        self._admit_skipped = 0
+        self._admit_skipped_tokens = 0
+        self._admit_F = 0.0
         self._pending_parks = []
         self._pending_starts = {}      # id(pool) -> {start, ...}, so eviction skips them
         self._park_pending_peak = 0
@@ -1541,6 +1588,11 @@ class IdleKVParkManager:
                                   for k, v in self._park_phase_ms.items()},
                 "park_bytes_moved": self._park_bytes,
                 "park_async": 1 if PARK_ASYNC else 0,
+                "admit_skipped": self._admit_skipped,
+                "admit_skipped_tokens": self._admit_skipped_tokens,
+                "admit_F": round(self._admit_F, 2),
+                "reuse_gap_s": round(self._reuse_gap_s(), 1),
+                "hit_age_samples": len(self._hit_ages),
                 "park_pending_peak": self._park_pending_peak,
                 "park_publish_lag_ms": round(self._park_publish_lag_ms, 1),
                 "park_n": self._park_n,
@@ -1878,6 +1930,70 @@ class IdleKVParkManager:
                 return ent[0]  # slab base to overwrite
         return None
 
+    def _reuse_gap_s(self) -> float:
+        """How long a parked prefix waits before it is read, measured from hits.
+
+        Falls back to the prior until PARK_GAP_MIN_SAMPLES hits have been seen, because
+        the first few ages are dominated by warm-up and a threshold built on two samples
+        would swing the admission rule wildly at exactly the moment the pool is filling."""
+        if len(self._hit_ages) < PARK_GAP_MIN_SAMPLES:
+            return PARK_REUSE_GAP_S
+        return statistics.median(self._hit_ages)
+
+    def _admit_park(self, pool, n: int) -> bool:
+        """Should this park be written at all?
+
+        Oversubscription F = (what will be written during one reuse gap) / (pool size).
+        F <= 1 means a slab comfortably outlives its reuse, so admit everything. Above
+        that, only the longest 1/F of recent parks can survive to be used, so admit only
+        those -- keeping the ones whose re-prefill would cost the most.
+        """
+        if not PARK_ADMIT:
+            return True
+        now = time.time()
+        # TWO windows, and the split is what makes this a control loop rather than a
+        # fixed filter. The rate must come from what was ADMITTED, because only admitted
+        # parks consume the pool; feeding it the offered rate means skipping never lowers
+        # F and the rule just applies a constant threshold forever. The length quantile
+        # must come from what was OFFERED, or the threshold would be computed from an
+        # already-filtered sample and ratchet upward.
+        self._offered.append((now, n))
+        while self._offered and now - self._offered[0][0] > 30.0:
+            self._offered.popleft()
+        while self._park_window and now - self._park_window[0][0] > 30.0:
+            self._park_window.popleft()
+        if len(self._offered) < 8:
+            return True                      # not enough history to rate-limit on
+        span = max(1e-3, now - (self._park_window[0][0] if self._park_window
+                                else self._offered[0][0]))
+        rate = sum(x[1] for x in self._park_window) / span      # ADMITTED tokens/s
+        gap = self._reuse_gap_s()
+        F = rate * gap / max(1, pool.N)
+        self._admit_F = F
+        admit = True
+        if F > 1.0:
+            # Threshold by TOKEN MASS, not by count. What consumes the pool is bytes, and
+            # "the longest 1/F by count" admits far more than 1/F of the bytes precisely
+            # because it selects the long ones -- the loop then settles at F ~ 1.7 instead
+            # of 1. Take the longest parks until their tokens reach 1/F of what is being
+            # offered, and use that length as the cut.
+            lens = sorted((x[1] for x in self._offered), reverse=True)
+            budget = sum(lens) / F
+            acc = 0
+            cut = lens[-1]
+            for L in lens:
+                acc += L
+                cut = L
+                if acc >= budget:
+                    break
+            admit = n >= cut
+        if admit:
+            self._park_window.append((now, n))
+            return True
+        self._admit_skipped += 1
+        self._admit_skipped_tokens += n
+        return False
+
     def _upload_indices(self, indices, device):
         """Upload slot indices to `device` without stalling on the copy stream.
 
@@ -2015,6 +2131,11 @@ class IdleKVParkManager:
         _t = time.perf_counter()
         pool = self._select_pool(need=n)  # idlest fast-link GPU that has room
         self._park_phase_ms["select"] += (time.perf_counter() - _t) * 1000.0
+        if not self._admit_park(pool, n):
+            # Would be overwritten before its next turn could read it, so writing it would
+            # only shorten the life of every other slab. Skipping is not a lost hit: the
+            # hit was not going to happen.
+            return
         if pool.session_keyed:
             # This conversation reuses its own slab (found by prefix-supersession),
             # overwritten in place; a new conversation takes a free slab (evict LRU if
@@ -2117,6 +2238,9 @@ class IdleKVParkManager:
         # the whole record look untrustworthy.
         self._parked_tokens += n
         self._park_n += 1
+        self._park_time[h] = time.time()
+        if len(self._park_time) > 4096:
+            self._park_time.popitem(last=False)
         self._recent_parked.append((h, n))  # dense: reflects the next-turn window
         if self._parked_count <= 5 or self._copied_count % 50 == 0:
             self._parked_count += 1
@@ -2372,6 +2496,11 @@ class IdleKVParkManager:
         # Charge the cost to the tier that served it. `fetched` (not n) is the number of
         # tokens actually copied, so ms/token stays comparable across tiers even when the
         # local radix already held part of the prefix.
+        # Age at hit: what the admission rule needs to know the real reuse gap, rather
+        # than assuming one.
+        _pt = self._park_time.get(_prefix_hash(token_ids, n))
+        if _pt is not None:
+            self._hit_ages.append(time.time() - _pt)
         tier = "host" if is_host else ("peer" if is_cross else "local")
         self._fetch_ms_tier[tier] += ms
         self._fetch_tok_tier[tier] += fetched
