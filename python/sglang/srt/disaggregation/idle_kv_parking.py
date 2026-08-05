@@ -698,6 +698,12 @@ class IdleKVParkManager:
         # neighbour and a PCIe-only one, and on this box the park candidates span both
         # (NVLink pairs are (0,1) and (2,3)). Achieved bandwidth per source is the only
         # way to tell a slow link from a slow copy implementation.
+        # Park-side cost. Unmeasured until the fetch breakdown showed the fetch could
+        # only account for 1% of the TTFT gap while parking moved 5.7x the bytes.
+        self._park_phase_ms = {"index": 0.0, "gather": 0.0, "xfer": 0.0, "write": 0.0,
+                               "sync": 0.0, "select": 0.0}
+        self._park_bytes = 0
+        self._park_n = 0
         self._fetch_src_ms = {}
         self._fetch_src_tok = {}
         self._fetch_src_n = {}
@@ -1472,6 +1478,10 @@ class IdleKVParkManager:
                 "fetch_phase_ms": {k: round(v, 1)
                                    for k, v in self._fetch_phase_ms.items()},
                 "miss_find_ms_sum": round(self._miss_find_ms_sum, 1),
+                "park_phase_ms": {k: round(v, 1)
+                                  for k, v in self._park_phase_ms.items()},
+                "park_bytes_moved": self._park_bytes,
+                "park_n": self._park_n,
                 "fetch_src_ms": {k: round(v, 1) for k, v in self._fetch_src_ms.items()},
                 "fetch_src_tok": dict(self._fetch_src_tok),
                 "fetch_src_n": dict(self._fetch_src_n),
@@ -1802,12 +1812,46 @@ class IdleKVParkManager:
     def _gather_copy_peer_to_park(self, pool, src_k, src_v, src_indices, start: int, n: int) -> None:
         """Copy source decode-pool KV slots -> the given park pool, across all layers.
         src_k/src_v are the IPC-mapped buffers of the decode node that held the sequence."""
+        # THIS PATH MOVES 5.7x WHAT THE FETCH PATH DOES and was entirely unaccounted.
+        # Chasing the fetch's 80 ms was chasing 1% of the TTFT gap; parking wrote 535 GB
+        # against 94 GB fetched, and at the copy efficiency actually measured that is ~52 s
+        # against a 70 s wall-clock gap. It also runs on the scheduler MAIN THREAD (via
+        # poll_incoming, because the allocator is not thread-safe), and unlike the fetch it
+        # ends in a full device synchronize -- so every byte of it is blocking.
+        #
+        # Split the same way as the fetch so the cost is attributable rather than totalled:
+        #   gather   src_k[layer][s] on the PEER device -- a gather kernel plus a temporary
+        #            allocated on a GPU this process does not own the allocator for.
+        #   xfer     the cross-device copy, i.e. the only part that is actually the link.
+        #   write    the contiguous store into the park pool.
+        #   sync     the blocking wait. If this dominates, the cost is not the copy at all
+        #            but the decision to make parking synchronous.
         peer_dev = f"cuda:{src_k[0].device.index}"
+        t = time.perf_counter()
         s = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
+        t_idx = time.perf_counter() - t
+        t_g = t_x = t_w = 0.0
         for layer in range(len(src_k)):
-            pool.k[layer][start : start + n] = src_k[layer][s].to(pool.dev)
-            pool.v[layer][start : start + n] = src_v[layer][s].to(pool.dev)
+            a = time.perf_counter()
+            gk = src_k[layer][s]
+            gv = src_v[layer][s]
+            b = time.perf_counter()
+            ck = gk.to(pool.dev)
+            cv = gv.to(pool.dev)
+            c = time.perf_counter()
+            pool.k[layer][start : start + n] = ck
+            pool.v[layer][start : start + n] = cv
+            d = time.perf_counter()
+            t_g += b - a
+            t_x += c - b
+            t_w += d - c
+        a = time.perf_counter()
         torch.cuda.synchronize(pool.gpu)
+        t_s = time.perf_counter() - a
+        for k, v in (("index", t_idx), ("gather", t_g), ("xfer", t_x), ("write", t_w),
+                     ("sync", t_s)):
+            self._park_phase_ms[k] += v * 1000.0
+        self._park_bytes += n * self._bytes_per_token()
 
     def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0,
                      src_gpu: int = -1) -> None:
@@ -1848,7 +1892,9 @@ class IdleKVParkManager:
             return
         # `n` matters: the choice is "which pool can take THIS park without evicting",
         # not "which pool is non-empty".
+        _t = time.perf_counter()
         pool = self._select_pool(need=n)  # idlest fast-link GPU that has room
+        self._park_phase_ms["select"] += (time.perf_counter() - _t) * 1000.0
         if pool.session_keyed:
             # This conversation reuses its own slab (found by prefix-supersession),
             # overwritten in place; a new conversation takes a free slab (evict LRU if
@@ -1920,6 +1966,7 @@ class IdleKVParkManager:
         # "fetched_tokens: 985319" -- a telemetry line that contradicts itself and makes
         # the whole record look untrustworthy.
         self._parked_tokens += n
+        self._park_n += 1
         self._recent_parked.append((h, n))  # dense: reflects the next-turn window
         if self._parked_count <= 5 or self._copied_count % 50 == 0:
             self._parked_count += 1
