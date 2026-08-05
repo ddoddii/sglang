@@ -722,9 +722,11 @@ class IdleKVParkManager:
         self._park_n = 0
         # Parks whose copy is enqueued but not yet known to have landed. Drained on each
         # scheduler pass; their slabs are reserved but deliberately not yet findable.
+        self._idx_free = []            # pinned index-staging buffers, see _upload_indices
         self._pending_parks = []
         self._pending_starts = {}      # id(pool) -> {start, ...}, so eviction skips them
         self._park_pending_peak = 0
+        self._pending_idx_buf = None
         self._park_publish_lag_ms = 0.0
         self._fetch_src_ms = {}
         self._fetch_src_tok = {}
@@ -1298,6 +1300,7 @@ class IdleKVParkManager:
                 still.append(e)
                 continue
             self._park_publish_lag_ms += (time.time() - e["t"]) * 1000.0
+            self._release_idx_buf(e.get("idx_buf"))
             pend = self._pending_starts.get(id(e["pool"]))
             if pend is not None:
                 pend.discard(e["start"])
@@ -1875,6 +1878,42 @@ class IdleKVParkManager:
                 return ent[0]  # slab base to overwrite
         return None
 
+    def _upload_indices(self, indices, device):
+        """Upload slot indices to `device` without stalling on the copy stream.
+
+        `torch.tensor(list, device=cuda)` builds a PAGEABLE host tensor and copies it with
+        a blocking cudaMemcpy, which waits for everything already queued on that stream.
+        That is 80 KB of indices waiting behind hundreds of megabytes of KV: once parking
+        went asynchronous and the queue stopped draining between parks, this line went from
+        0.2 s to 4.4 s over a run and became the largest cost in the park path.
+
+        Pinned staging plus non_blocking makes the copy async. The buffer must then not be
+        rewritten until the copy has been consumed, so it is borrowed from a pool and
+        returned only when the park's event fires (or immediately, on the blocking path).
+
+        Returns (device_tensor, buffer_to_return_later).
+        """
+        n = len(indices)
+        cap = 1 << max(13, (n - 1).bit_length())    # power-of-two size classes, >= 8192
+        buf = None
+        for i, b in enumerate(self._idx_free):
+            if b.numel() >= cap:
+                buf = self._idx_free.pop(i)
+                break
+        if buf is None:
+            try:
+                buf = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            except Exception:  # noqa: BLE001  (pinning can fail under host pressure)
+                return torch.tensor(indices, dtype=torch.long, device=device), None
+        buf[:n] = torch.as_tensor(indices, dtype=torch.int64)
+        return buf[:n].to(device, non_blocking=True), buf
+
+    def _release_idx_buf(self, buf) -> None:
+        if buf is None:
+            return
+        if len(self._idx_free) < 16:      # a cap, so a burst cannot pin unbounded host RAM
+            self._idx_free.append(buf)
+
     def _gather_copy_peer_to_park(self, pool, src_k, src_v, src_indices, start: int, n: int) -> None:
         """Copy source decode-pool KV slots -> the given park pool, across all layers.
         src_k/src_v are the IPC-mapped buffers of the decode node that held the sequence."""
@@ -1894,7 +1933,7 @@ class IdleKVParkManager:
         #            but the decision to make parking synchronous.
         peer_dev = f"cuda:{src_k[0].device.index}"
         t = time.perf_counter()
-        s = torch.tensor(src_indices, dtype=torch.long, device=peer_dev)
+        s, idx_buf = self._upload_indices(src_indices, peer_dev)
         t_idx = time.perf_counter() - t
         t_g = t_x = t_w = 0.0
         for layer in range(len(src_k)):
@@ -1922,11 +1961,16 @@ class IdleKVParkManager:
                 ev.record()
         else:
             torch.cuda.synchronize(pool.gpu)
+            self._release_idx_buf(idx_buf)   # copy has landed; safe to rewrite
+            idx_buf = None
         t_s = time.perf_counter() - a
         for k, v in (("index", t_idx), ("gather", t_g), ("xfer", t_x), ("write", t_w),
                      ("sync", t_s)):
             self._park_phase_ms[k] += v * 1000.0
         self._park_bytes += n * self._bytes_per_token()
+        # On the async path the pinned buffer is still referenced by an in-flight copy;
+        # it goes back to the pool when the event fires, not here.
+        self._pending_idx_buf = idx_buf
         return ev
 
     def _park_to_gpu(self, token_ids, src_indices, n: int, prefix_len: int = 0,
@@ -2032,6 +2076,7 @@ class IdleKVParkManager:
             # told to skip it via _pending_starts.
             self._pending_parks.append({
                 "ev": ev, "pool": pool, "h": h, "start": start, "n": n,
+                "idx_buf": self._pending_idx_buf,
                 "prefix_len": prefix_len, "token_ids": token_ids, "ms": ms,
                 "t": time.time(),
             })
