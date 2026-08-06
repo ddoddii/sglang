@@ -233,6 +233,19 @@ PARK_ASYNC = os.environ.get("SGLANG_KV_PARK_ASYNC_PARK", "1") == "1"
 # mechanism is a no-op. It only engages if the true reuse gap turns out to be much longer
 # than 12 s -- which is exactly what the hit-age instrumentation added alongside it
 # measures. Do not assume it is reducing park volume; read admit_skipped_tokens.
+# --- victim cache: a prefill parks its OWN evicted KV ---------------------------------
+# The original data flow had DECODE send finished sequences back to a prefill, which made
+# the prompt KV take a round trip P -> D -> park GPU -> P for data the prefill computed
+# itself. 534 of 535 GB parked on the long-context workload was exactly that. Hooking the
+# prefill's own eviction instead gives hicache's shape -- evict to a second tier, read it
+# back -- with peer HBM instead of host DRAM.
+PARK_ON_EVICT = os.environ.get("SGLANG_KV_PARK_ON_EVICT", "1") == "1"
+# Below this, a parked block is not worth its own copy: re-prefilling a few hundred tokens
+# costs less than the park plus fetch, and short blocks are what crowd the pool.
+PARK_ON_EVICT_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_ON_EVICT_MIN_TOKENS", "512"))
+# Keep the old decode-initiated path available, but OFF by default now: on this workload
+# it was 99.8% redundant with what on-evict parks, and it is the round trip.
+PARK_FROM_DECODE = os.environ.get("SGLANG_KV_PARK_FROM_DECODE", "0") == "1"
 PARK_ADMIT = os.environ.get("SGLANG_KV_PARK_ADMIT", "1") == "1"
 # Prior for the reuse gap, used only until enough hits have been observed to measure it.
 PARK_REUSE_GAP_S = float(os.environ.get("SGLANG_KV_PARK_REUSE_GAP_S", "12"))
@@ -771,6 +784,9 @@ class IdleKVParkManager:
         self._admit_skipped = 0
         self._admit_skipped_tokens = 0
         self._admit_F = 0.0
+        self._evict_parks = 0        # victim-cache parks triggered by our own eviction
+        self._evict_too_short = 0
+        self._evict_mismatch = 0
         # Host-tier park cost, split so the comparison against the GPU tier is mechanistic
         # rather than a single number: alloc is the pinning the GPU path never pays.
         self._host_phase_ms = {"alloc": 0.0, "copy": 0.0, "sync": 0.0}
@@ -1272,7 +1288,7 @@ class IdleKVParkManager:
         NOTE (slice 3c): correctness under reuse needs an ack so D holds the slots
         until P has copied; for now the tool-call idle gap keeps them valid at low load.
         """
-        if self.role != "decode" or not self._push_by_gpu:
+        if self.role != "decode" or not self._push_by_gpu or not PARK_FROM_DECODE:
             return False
         if getattr(req, "req_pool_idx", -1) == -1:
             return False
@@ -1602,6 +1618,11 @@ class IdleKVParkManager:
                 "host_park_n": self._host_n,
                 "host_cold_pins": self._host_cold_pins,
                 "host_cold_pin_ms": round(self._host_cold_pin_ms, 1),
+                "evict_parks": self._evict_parks,
+                "evict_too_short": self._evict_too_short,
+                "evict_mismatch": self._evict_mismatch,
+                "park_on_evict": 1 if PARK_ON_EVICT else 0,
+                "park_from_decode": 1 if PARK_FROM_DECODE else 0,
                 "admit_skipped": self._admit_skipped,
                 "admit_skipped_tokens": self._admit_skipped_tokens,
                 "admit_F": round(self._admit_F, 2),
@@ -1963,6 +1984,71 @@ class IdleKVParkManager:
                 return ent[0]  # slab base to overwrite
         return None
 
+    def on_evict(self, node) -> None:
+        """A radix node is about to have its KV freed. Copy it into spare peer HBM first.
+
+        THIS IS THE VICTIM CACHE, and it is the path the design should have had from the
+        start. Parking used to be initiated by DECODE, which sent a finished sequence's
+        full KV back to a prefill. But in PD disaggregation the prompt KV was computed BY
+        a prefill and shipped to decode -- so parking it back made the prompt take a round
+        trip P -> D -> park GPU -> P, four hops, for data the prefill had itself and threw
+        away. Measured on the long-context workload: 534 of 535 GB parked was prompt KV of
+        exactly that kind, and the prefill still held it in only 8 of ~500 cases.
+
+        hicache never pays that: a prefill evicts to its OWN host DRAM and reads it back.
+        Two hops, node-local. Hooking eviction here gives the same shape with peer HBM in
+        place of host DRAM, so the comparison finally isolates the medium -- which is where
+        the NVLink advantage and the absence of pinning actually live.
+
+        WHY THE WHOLE ROOT PATH, not just this node: a fetch matches by prefix hash over
+        the request's tokens, so a parked block is only findable if it starts at token 0.
+        A leaf's key is a tail segment and would never match.
+
+        WHY IT IS SAFE TO READ SLOTS THAT ARE ABOUT TO BE FREED: free() only returns
+        indices to the allocator's free list. Whatever reuses them writes on the forward
+        stream, which waits on the default stream where this copy is enqueued, so the read
+        is ordered before any overwrite -- the same argument the fetch path relies on.
+
+        KNOWN LIMITATION: eviction peels a chain leaf-first, so a long session can be
+        parked once at its full length and then again at shorter lengths as its ancestors
+        become leaves. The shorter copies are redundant. Admission control drops them
+        first, since it keeps the longest blocks, but this is a real inefficiency and not
+        a subtle one -- it is written down rather than hidden.
+        """
+        if self.role != "prefill" or not self._pools or not PARK_ON_EVICT:
+            return
+        try:
+            toks, vals, cur = [], [], node
+            # Walk to the root. The root's value is [] and its lock_ref is 1.
+            while cur is not None and getattr(cur, "parent", None) is not None:
+                k = getattr(cur, "key", None)
+                v = getattr(cur, "value", None)
+                if k is None or v is None or len(v) == 0:
+                    return
+                ids = getattr(k, "token_ids", k)
+                toks.append(list(ids))
+                vals.append(v)
+                cur = cur.parent
+            if not toks:
+                return
+            toks.reverse()
+            vals.reverse()
+            token_ids = [t for seg in toks for t in seg]
+            n = len(token_ids)
+            if n < PARK_ON_EVICT_MIN_TOKENS:
+                self._evict_too_short += 1
+                return
+            idx = torch.cat([v if torch.is_tensor(v) else torch.as_tensor(v)
+                             for v in vals]).to(torch.int64)
+            if idx.numel() != n:
+                # Token count and slot count must agree or the copy would be misaligned.
+                self._evict_mismatch += 1
+                return
+            self._evict_parks += 1
+            self._park_to_gpu(token_ids, idx, n, prefix_len=0, src_gpu=self.gpu_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Idle KV parking [prefill]: on_evict failed: %r", e)
+
     def _reuse_gap_s(self) -> float:
         """How long a parked prefix waits before it is read, measured from hits.
 
@@ -2042,6 +2128,14 @@ class IdleKVParkManager:
 
         Returns (device_tensor, buffer_to_return_later).
         """
+        # Victim-cache path: the indices came out of the local radix tree and are already
+        # a tensor on the device we are gathering from. Staging that through pinned host
+        # memory would be a pointless D2H round trip -- and `buf[:n] = cuda_tensor` would
+        # be a blocking device-to-host copy, reintroducing exactly the stall the pinned
+        # buffer exists to remove.
+        if torch.is_tensor(indices):
+            t = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+            return (t if str(t.device) == str(device) else t.to(device)), None
         n = len(indices)
         cap = 1 << max(13, (n - 1).bit_length())    # power-of-two size classes, >= 8192
         buf = None
@@ -2131,15 +2225,19 @@ class IdleKVParkManager:
         if n > PARK_POOL_TOKENS or not self._pools:
             return
         _host_fallback = None      # set below when no GPU pool can take this park
-        # Source decode pool this KV lives in (N-node). Fall back to the single-peer
-        # buffer for 1P1D back-compat.
-        src = self.peer_decode_pools.get(src_gpu)
-        if src is None:
-            if self.peer_k_buffer is None:
-                return
-            src_k, src_v = self.peer_k_buffer, self.peer_v_buffer
+        # Where the KV being parked currently lives. src_gpu == this GPU means it is our
+        # OWN pool -- the victim-cache path, where a prefill parks what it is about to
+        # evict. Otherwise it is a decode node's pool reached over CUDA IPC.
+        if src_gpu == self.gpu_id:
+            src_k, src_v = self.k_buffer, self.v_buffer
         else:
-            src_k, src_v = src
+            src = self.peer_decode_pools.get(src_gpu)
+            if src is None:
+                if self.peer_k_buffer is None:
+                    return
+                src_k, src_v = self.peer_k_buffer, self.peer_v_buffer
+            else:
+                src_k, src_v = src
         h = _prefix_hash(token_ids, n)
         found, fent = self._find_parked(h)
         if found is not None:

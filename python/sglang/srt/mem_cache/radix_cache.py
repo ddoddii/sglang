@@ -325,6 +325,12 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        # Set by a victim-cache tier that wants to see nodes before their KV is freed.
+        # Deliberately NOT cleared here: reset() rebuilds the tree, but the tier that
+        # installed the hook outlives it, and dropping the hook on reset would silently
+        # turn parking off for the rest of the run.
+        if not hasattr(self, "evict_hook"):
+            self.evict_hook = None
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -556,6 +562,16 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # Victim hook, called BEFORE the free while the KV still exists. Idle KV
+            # parking uses it to copy what is about to be lost into spare HBM on a peer
+            # GPU -- the same role hicache's host tier plays, without leaving the GPU.
+            # Anything raised here is swallowed: a cache tier must never be able to break
+            # eviction, which is what keeps the server alive under memory pressure.
+            if self.evict_hook is not None:
+                try:
+                    self.evict_hook(x)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("evict_hook failed, continuing eviction: %r", e)
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)

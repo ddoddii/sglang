@@ -708,6 +708,12 @@ class Scheduler(
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
             )
+            # Victim-cache hook: the manager sees each node just before its KV is freed,
+            # so a prefill can copy what it is losing into spare peer HBM instead of
+            # re-acquiring it from a decode node later. Installed only when the tree
+            # supports the hook, so a non-radix cache (chunk cache) is unaffected.
+            if hasattr(self.tree_cache, "evict_hook"):
+                self.tree_cache.evict_hook = self.idle_kv_park_manager.on_evict
         else:
             self.idle_kv_park_manager = None
 
