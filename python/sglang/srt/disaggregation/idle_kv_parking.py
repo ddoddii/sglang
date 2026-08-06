@@ -798,6 +798,7 @@ class IdleKVParkManager:
         self._evict_parks = 0        # victim-cache parks triggered by our own eviction
         self._evict_too_short = 0
         self._evict_mismatch = 0
+        self._evict_covered = 0      # skipped: a longer path containing it is parked
         # Host-tier park cost, split so the comparison against the GPU tier is mechanistic
         # rather than a single number: alloc is the pinning the GPU path never pays.
         self._host_phase_ms = {"alloc": 0.0, "copy": 0.0, "sync": 0.0}
@@ -1632,6 +1633,7 @@ class IdleKVParkManager:
                 "evict_parks": self._evict_parks,
                 "evict_too_short": self._evict_too_short,
                 "evict_mismatch": self._evict_mismatch,
+                "evict_covered": self._evict_covered,
                 "park_on_evict": 1 if PARK_ON_EVICT else 0,
                 "park_from_decode": 1 if PARK_FROM_DECODE else 0,
                 "admit_skipped": self._admit_skipped,
@@ -2020,13 +2022,19 @@ class IdleKVParkManager:
         stream, which waits on the default stream where this copy is enqueued, so the read
         is ordered before any overwrite -- the same argument the fetch path relies on.
 
-        KNOWN LIMITATION: eviction peels a chain leaf-first, so a long session can be
-        parked once at its full length and then again at shorter lengths as its ancestors
-        become leaves. The shorter copies are redundant. Admission control drops them
-        first, since it keeps the longest blocks, but this is a real inefficiency and not
-        a subtle one -- it is written down rather than hidden.
+        PEELING, and why ancestors are marked: eviction takes leaves first, so a chain is
+        parked at its full length and then AGAIN at every shorter length as each parent
+        becomes a leaf in turn. Measured, that produced 782-1336 blocks where the previous
+        design produced 452, and the redundant short copies crowded the pool hard enough to
+        halve the fetch hit rate (31-46% -> 15-19%). Once a root path is parked, every
+        ancestor's own root path is a strict PREFIX of it and is therefore already stored,
+        so ancestors are marked and skipped.
         """
         if self.role != "prefill" or not self._pools or not PARK_ON_EVICT:
+            return
+        if getattr(node, "_park_covered", False):
+            # A descendant already parked a longer path that contains this one.
+            self._evict_covered += 1
             return
         try:
             toks, vals, cur = [], [], node
@@ -2057,6 +2065,13 @@ class IdleKVParkManager:
                 return
             self._evict_parks += 1
             self._park_to_gpu(token_ids, idx, n, prefix_len=0, src_gpu=self.gpu_id)
+            # Mark ancestors: their root paths are prefixes of what was just parked, so
+            # parking them again would store the same bytes at a shorter length and evict
+            # somebody else's block to do it.
+            anc = getattr(node, "parent", None)
+            while anc is not None and getattr(anc, "parent", None) is not None:
+                anc._park_covered = True
+                anc = anc.parent
         except Exception as e:  # noqa: BLE001
             logger.debug("Idle KV parking [prefill]: on_evict failed: %r", e)
 
