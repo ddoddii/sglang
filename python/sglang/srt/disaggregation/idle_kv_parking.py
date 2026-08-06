@@ -246,9 +246,20 @@ PARK_ON_EVICT_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_ON_EVICT_MIN_TOKEN
 # Keep the old decode-initiated path available, but OFF by default now: on this workload
 # it was 99.8% redundant with what on-evict parks, and it is the round trip.
 PARK_FROM_DECODE = os.environ.get("SGLANG_KV_PARK_FROM_DECODE", "0") == "1"
-PARK_ADMIT = os.environ.get("SGLANG_KV_PARK_ADMIT", "1") == "1"
-# Prior for the reuse gap, used only until enough hits have been observed to measure it.
-PARK_REUSE_GAP_S = float(os.environ.get("SGLANG_KV_PARK_REUSE_GAP_S", "12"))
+# OFF BY DEFAULT, because it was built on a prior that turned out to be wrong and it did
+# real damage. The prior said a parked prefix waits ~12 s to be read; measured, it is 2.2 s
+# -- 5.5x too high, which inflated oversubscription F by 5.5x. On the victim-cache run that
+# turned a rule meant to be a no-op into one that threw away 828 of 1288 parks (64%) and
+# collapsed the fetch hit rate from 31-46% to 8%.
+#
+# It also had a feedback trap: throttling cut hits, hits are what supply the age samples,
+# and with too few samples the prior stayed in use -- so it could not measure its way out
+# of its own mistake. Fixed below by not throttling at all until the gap is measured, but
+# the default stays off: nothing has yet shown this pool needs rationing.
+PARK_ADMIT = os.environ.get("SGLANG_KV_PARK_ADMIT", "0") == "1"
+# Prior for the reuse gap. Measured at 2.2 s on the long-context workload; the previous
+# value of 12 s was a guess and it was the whole problem.
+PARK_REUSE_GAP_S = float(os.environ.get("SGLANG_KV_PARK_REUSE_GAP_S", "2.2"))
 # Below this many observed hits the measured gap is not trusted and the prior is used.
 PARK_GAP_MIN_SAMPLES = int(os.environ.get("SGLANG_KV_PARK_GAP_MIN_SAMPLES", "20"))
 FORCE_HOST = os.environ.get("SGLANG_KV_PARK_FORCE_HOST", "0") == "1"
@@ -2056,7 +2067,7 @@ class IdleKVParkManager:
         the first few ages are dominated by warm-up and a threshold built on two samples
         would swing the admission rule wildly at exactly the moment the pool is filling."""
         if len(self._hit_ages) < PARK_GAP_MIN_SAMPLES:
-            return PARK_REUSE_GAP_S
+            return None      # unknown; the caller must not throttle on a guess
         return statistics.median(self._hit_ages)
 
     def _admit_park(self, pool, n: int) -> bool:
@@ -2087,6 +2098,12 @@ class IdleKVParkManager:
                                 else self._offered[0][0]))
         rate = sum(x[1] for x in self._park_window) / span      # ADMITTED tokens/s
         gap = self._reuse_gap_s()
+        if gap is None:
+            # Not measured yet. Admit -- and keep admitting, since hits are what produce
+            # the samples. Throttling here is what created the trap that could not
+            # measure its way out.
+            self._park_window.append((now, n))
+            return True
         F = rate * gap / max(1, pool.N)
         self._admit_F = F
         admit = True
