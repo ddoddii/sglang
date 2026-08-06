@@ -192,6 +192,18 @@ class MooncakeTransferEngine:
             # selectable instead of patching it out. Default stays "rdma", which is
             # upstream behaviour, and SGLANG_MOONCAKE_PROTOCOL=tcp opts out on a node
             # where the RDMA path cannot register GPU memory.
+            #
+            # MEASURED, AND IT IS NOT ENOUGH ON ITS OWN. On mooncake-transfer-engine
+            # 0.3.8.post1, passing "tcp" here does NOT select TCP: the log still says
+            #     Topology discovery complete. Found 2 HCAs.
+            #     installTransport, type=rdma
+            # and GPU registration still returns EFAULT. The transport is chosen by
+            # whether topology auto-discovery finds an HCA, not by this argument. So on
+            # such a node this knob has to be paired with something that makes the
+            # discovery come up empty -- see scripts/slurm/probe_mooncake.py --sweep in
+            # the experiments repo, which searches for that setting. The knob is kept
+            # because it costs nothing, is honest about what it does, and a later
+            # mooncake may well respect it.
             protocol = os.environ.get("SGLANG_MOONCAKE_PROTOCOL", "rdma")
             if protocol != "rdma":
                 logger.info(
