@@ -1664,7 +1664,12 @@ class IdleKVParkManager:
                 "admit_skipped": self._admit_skipped,
                 "admit_skipped_tokens": self._admit_skipped_tokens,
                 "admit_F": round(self._admit_F, 2),
-                "reuse_gap_s": round(self._reuse_gap_s(), 1),
+                # None until enough hits have been seen to measure it -- round() would
+                # raise, and the whole payload with it. This exact line silently killed
+                # park telemetry for three runs: the publish is wrapped in a bare except,
+                # so every 0.5 s tick threw and nothing was ever written.
+                "reuse_gap_s": (lambda g: round(g, 1) if g is not None else None)(
+                    self._reuse_gap_s()),
                 "hit_age_samples": len(self._hit_ages),
                 "park_pending_peak": self._park_pending_peak,
                 "park_publish_lag_ms": round(self._park_publish_lag_ms, 1),
@@ -2148,7 +2153,9 @@ class IdleKVParkManager:
         except Exception as e:  # noqa: BLE001
             logger.debug("Idle KV parking [prefill]: on_evict failed: %r", e)
 
-    def _reuse_gap_s(self) -> float:
+    def _reuse_gap_s(self):
+        # Returns None when unmeasured. Callers MUST handle that -- see the publish path,
+        # where round(None) took down all telemetry.
         """How long a parked prefix waits before it is read, measured from hits.
 
         Falls back to the prior until PARK_GAP_MIN_SAMPLES hits have been seen, because
