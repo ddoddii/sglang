@@ -178,10 +178,31 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            # Upstream hardcodes "rdma" here. That is right when RDMA works, and wrong
+            # in a way that is hard to read when it does not: mooncake falls back to TCP
+            # only when it discovers NO HCA, so a node that has InfiniBand but lacks
+            # GPUDirect RDMA (no nvidia_peermem) installs the rdma transport and then
+            # fails every KV pool registration with
+            #     Failed to register memory 0x...: Bad address [14]
+            # The server still reaches "ready to roll", so the failure surfaces later as
+            # KVTransferError on the first request.
+            #
+            # For a single-node PD run -- prefill and decode on two GPUs of one host --
+            # RDMA buys nothing; the bytes never leave the box. So make the protocol
+            # selectable instead of patching it out. Default stays "rdma", which is
+            # upstream behaviour, and SGLANG_MOONCAKE_PROTOCOL=tcp opts out on a node
+            # where the RDMA path cannot register GPU memory.
+            protocol = os.environ.get("SGLANG_MOONCAKE_PROTOCOL", "rdma")
+            if protocol != "rdma":
+                logger.info(
+                    "Mooncake transfer protocol overridden to %r via "
+                    "SGLANG_MOONCAKE_PROTOCOL",
+                    protocol,
+                )
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                protocol,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
