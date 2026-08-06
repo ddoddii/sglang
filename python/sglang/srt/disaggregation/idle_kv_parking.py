@@ -810,6 +810,7 @@ class IdleKVParkManager:
         self._evict_mismatch = 0
         self._evict_covered = 0      # skipped: a longer path containing it is parked
         self._complete_parks = 0     # parked at request completion (into the gap)
+        self._publish_failed = False
         # Host-tier park cost, split so the comparison against the GPU tier is mechanistic
         # rather than a single number: alloc is the pinning the GPU path never pays.
         self._host_phase_ms = {"alloc": 0.0, "copy": 0.0, "sync": 0.0}
@@ -1513,6 +1514,17 @@ class IdleKVParkManager:
                             "%s", self.gpu_id, p.gpu,
                             "local" if p.gpu == self.gpu_id else
                             ("ENABLED" if ok else "UNKNOWN"))
+        if not self._pools:
+            # Every candidate GPU was skipped. Parking, fetching and telemetry are ALL
+            # gated on self._pools, so the node now behaves exactly like plain radix while
+            # still being labelled a park arm -- a silent no-op that looks like a result.
+            logger.error(
+                "Idle KV parking [prefill gpu%d]: NO park pool could be allocated on any "
+                "of GPU%s. Parking and fetching are DISABLED for this node; it will behave "
+                "as if idle-KV-parking were off. Lower SGLANG_KV_PARK_POOL_TOKENS or "
+                "SGLANG_KV_PARK_GPU_RESERVE_GB (currently %.1f GB).",
+                self.gpu_id, self.park_gpus, PARK_GPU_RESERVE_GB)
+            return
         got = [p.N for p in self._pools]
         total_gb = sum(p.gb for p in self._pools)
         logger.info(
@@ -1679,8 +1691,16 @@ class IdleKVParkManager:
             with open(tmp, "w") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, path)      # atomic: a sampler never sees a partial file
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Log the FIRST failure. This used to swallow everything forever, so a run
+            # could finish with no telemetry at all and the only symptom was the analysis
+            # saying "no park arm in this directory" -- with nothing to say why. Still
+            # never raises: telemetry must not be able to take down serving.
+            if not self._publish_failed:
+                self._publish_failed = True
+                logger.warning("Idle KV parking: telemetry publish failed (%r); "
+                               "parked_gpu%d.json will be missing for this run",
+                               e, self.gpu_id)
 
     def _publish_usage_loop(self) -> None:
         """Write this GPU's live serving KV usage to its telemetry file every 0.5s, plus
