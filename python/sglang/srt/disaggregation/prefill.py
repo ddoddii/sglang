@@ -484,6 +484,13 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                # Idle KV parking: the prompt KV is complete and its tree node is locked
+                # by cache_unfinished_req above, so this is the safest point to copy it
+                # into spare peer HBM -- and the tool-call gap that follows this turn is
+                # idle time the copy can overlap, which eviction-triggered parking cannot
+                # use because eviction only fires when the server is already busy.
+                if self.idle_kv_park_manager is not None:
+                    self.idle_kv_park_manager.park_prefill_done(req)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:

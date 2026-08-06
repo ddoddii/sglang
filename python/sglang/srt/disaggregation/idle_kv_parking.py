@@ -239,7 +239,17 @@ PARK_ASYNC = os.environ.get("SGLANG_KV_PARK_ASYNC_PARK", "1") == "1"
 # itself. 534 of 535 GB parked on the long-context workload was exactly that. Hooking the
 # prefill's own eviction instead gives hicache's shape -- evict to a second tier, read it
 # back -- with peer HBM instead of host DRAM.
-PARK_ON_EVICT = os.environ.get("SGLANG_KV_PARK_ON_EVICT", "1") == "1"
+# WHEN a prefill parks its own KV.
+#   complete  at request completion, into the tool-call gap that follows. The gap is idle
+#             time hicache's background writeback already exploits and eviction-triggered
+#             parking cannot, because eviction fires under pressure -- exactly when there
+#             is no gap. Also earlier, and once per request rather than once per peeled
+#             chain segment.
+#   evict     when the radix is about to free it. Tidy victim-cache semantics, bad timing.
+#   both      belt and braces; the dedup in _park_to_gpu keeps it from storing twice.
+PARK_TRIGGER = os.environ.get("SGLANG_KV_PARK_TRIGGER", "complete")
+PARK_ON_EVICT = os.environ.get("SGLANG_KV_PARK_ON_EVICT",
+                               "1" if PARK_TRIGGER in ("evict", "both") else "0") == "1"
 # Below this, a parked block is not worth its own copy: re-prefilling a few hundred tokens
 # costs less than the park plus fetch, and short blocks are what crowd the pool.
 PARK_ON_EVICT_MIN_TOKENS = int(os.environ.get("SGLANG_KV_PARK_ON_EVICT_MIN_TOKENS", "512"))
@@ -799,6 +809,7 @@ class IdleKVParkManager:
         self._evict_too_short = 0
         self._evict_mismatch = 0
         self._evict_covered = 0      # skipped: a longer path containing it is parked
+        self._complete_parks = 0     # parked at request completion (into the gap)
         # Host-tier park cost, split so the comparison against the GPU tier is mechanistic
         # rather than a single number: alloc is the pinning the GPU path never pays.
         self._host_phase_ms = {"alloc": 0.0, "copy": 0.0, "sync": 0.0}
@@ -1634,6 +1645,8 @@ class IdleKVParkManager:
                 "evict_too_short": self._evict_too_short,
                 "evict_mismatch": self._evict_mismatch,
                 "evict_covered": self._evict_covered,
+                "complete_parks": self._complete_parks,
+                "park_trigger": PARK_TRIGGER,
                 "park_on_evict": 1 if PARK_ON_EVICT else 0,
                 "park_from_decode": 1 if PARK_FROM_DECODE else 0,
                 "admit_skipped": self._admit_skipped,
@@ -1996,6 +2009,46 @@ class IdleKVParkManager:
             if ent is not None and ent[1] == L:
                 return ent[0]  # slab base to overwrite
         return None
+
+    def park_prefill_done(self, req) -> None:
+        """A prefill has just finished this request's prompt. Park it now, into the gap.
+
+        WHY NOT AT EVICTION. Parking on eviction is tidy -- a victim cache stores exactly
+        what is being lost -- but it fires at the worst possible moment. Eviction happens
+        under memory pressure, which is precisely when the server is busy, so the copy
+        competes with the forward pass instead of overlapping idle time. hicache does not
+        have this problem: its writeback is continuous and lands in whatever idle time
+        exists, which in an agentic workload is the tool-call gap after every turn.
+
+        Here that gap is 3 s and the server has nothing to do in it. Parking at completion
+        puts the copy there. It is also EARLIER than eviction, so the block cannot be lost
+        in the window between "evicted" and "parked", and it is once per request rather
+        than once per peeled chain segment.
+
+        SAFETY: cache_unfinished_req has locked this request's tree node and the request
+        sits in disagg_prefill_inflight_queue, so its slots cannot be freed underneath the
+        async copy. That is a stronger guarantee than the eviction path had.
+        """
+        if self.role != "prefill" or not self._pools:
+            return
+        if PARK_TRIGGER not in ("complete", "both"):
+            return
+        try:
+            ids = list(getattr(req, "origin_input_ids", None) or [])
+            if not ids:
+                return
+            n = (len(ids) // self.page_size) * self.page_size
+            if n < PARK_ON_EVICT_MIN_TOKENS:
+                self._evict_too_short += 1
+                return
+            row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+            if row.numel() < n:
+                return
+            self._complete_parks += 1
+            self._park_to_gpu(ids[:n], row[:n].to(torch.int64), n,
+                              prefix_len=0, src_gpu=self.gpu_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Idle KV parking [prefill]: park_prefill_done failed: %r", e)
 
     def on_evict(self, node) -> None:
         """A radix node is about to have its KV freed. Copy it into spare peer HBM first.
