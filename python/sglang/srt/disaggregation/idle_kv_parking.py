@@ -835,6 +835,12 @@ class IdleKVParkManager:
         # Counted separately from host-tier evictions (self._host.evicted_bytes) because
         # a GPU eviction and a host eviction are different policy decisions.
         self._dropped_tokens = 0
+        # Parks refused because the request was larger than the whole ring. Its own
+        # counter rather than folded into _dropped_tokens: dropping under PRESSURE is a
+        # policy outcome, whereas this is a sizing mistake -- the pool can never hold a
+        # request this long no matter how idle the GPU is -- and the two need different
+        # responses (leave it alone vs. raise SGLANG_KV_PARK_POOL_TOKENS).
+        self._park_oversize = 0
         # async fetch: enqueue the GPU2->GPU0 copy on the default stream and DON'T
         # host-synchronize. SGLang does forward_stream.wait_stream(default_stream)
         # before every forward, so the copy is guaranteed complete before the model
@@ -1623,6 +1629,11 @@ class IdleKVParkManager:
                 # derivable from writer_gpu without a second source of truth.
                 "serving_bytes": int(self._serving_used_tokens() or 0) * bpt,
                 "dropped_bytes": int(self._dropped_tokens) * bpt,
+                # Nonzero means the park pool is smaller than the requests being served,
+                # so this run's parking is sizing-limited, not policy-limited. Published
+                # because the alternative -- inferring it from a flat zero hit rate -- is
+                # exactly the ambiguity that hid it for a whole context-length sweep.
+                "park_oversize": self._park_oversize,
                 "host_evicted_bytes": int(self._host.evicted_bytes) if self._host else 0,
                 # --- where fetches were satisfied from (the counterpart of the above:
                 # residency only matters if the KV is actually read back)
@@ -2406,6 +2417,38 @@ class IdleKVParkManager:
                     self._fetch_nospace += 1
                     return
         else:
+            if n > pool.N:
+                # DOES NOT FIT IN THE RING AT ALL. The session-keyed branch above has
+                # had this check since it was written (`if n > pool.slab`); the ring
+                # path never did, and the way it failed was silent and destructive:
+                # `start` wraps to 0, `end` becomes n > N, the eviction loop below then
+                # sees every existing entry as "overlapping" [0, n) and deletes the
+                # WHOLE index, and only after that does the copy blow up on a shape
+                # mismatch (assigning n rows into a slice that clamps to N) -- an
+                # exception park_prefill_done catches and logs at DEBUG, invisible at
+                # sglang's default INFO level.
+                #
+                # So a request larger than the pool didn't just fail to park, it wiped
+                # what was already parked and reported nothing. Measured on a
+                # context-length sweep with a 15000-token pool (PARK_POOL_TOKENS=30000
+                # split over 2 candidates): every length from 16384 up took this path,
+                # park_fetch_hits stayed 0, and the arm's TTFT tracked the no-cache
+                # baseline exactly at 16k/32k/64k while looking like the mechanism was
+                # simply ineffective rather than never running.
+                if not self._park_oversize:
+                    logger.warning(
+                        "Idle KV parking [%s gpu%s]: park of %d tokens exceeds the "
+                        "park pool (%d tokens) -- too big for the ring. Raise "
+                        "SGLANG_KV_PARK_POOL_TOKENS above the largest request, or "
+                        "expect no parking at this length. (logged once)",
+                        self.role, self.gpu_id, n, pool.N,
+                    )
+                self._park_oversize += 1
+                if self._park_to_host(token_ids, src_k, src_v, src_indices, n,
+                                      prefix_len, src_gpu):
+                    return
+                self._dropped_tokens += n
+                return
             start = pool.next
             if start + n > pool.N:
                 start = 0  # wrap
