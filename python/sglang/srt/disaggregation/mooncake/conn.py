@@ -169,6 +169,21 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            # A blacklisted session is only ever cleared when the decode re-registers its
+            # KVArgs, which does not happen again during a run -- so one failed transfer
+            # takes a P->D pair down permanently. Observed: a single failure at 16:21:52
+            # cost 95 further requests on that one pair over the next 90 minutes, every
+            # one of them rejected without a transfer being attempted, while the other
+            # pair kept working. Both defaults reproduce upstream behaviour exactly
+            # (trip on the first failure, never recover); the run scripts raise them so a
+            # transient error costs one request instead of the rest of the experiment.
+            self.session_fail_threshold = max(
+                1, int(os.environ.get("SGLANG_DISAGG_SESSION_FAIL_THRESHOLD", "1"))
+            )
+            self.session_fail_cooldown_s = float(
+                os.environ.get("SGLANG_DISAGG_SESSION_FAIL_COOLDOWN_S", "0")
+            )
+            self.session_failed_at: Dict[str, float] = {}
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -699,6 +714,21 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def _session_cooldown_expired(self, session_id: str) -> bool:
+        """True if `session_id` is blacklisted but its cooldown has elapsed.
+
+        Caller must hold session_lock. Returns False when no cooldown is configured,
+        which keeps the upstream "blacklisted forever" behaviour byte for byte.
+        """
+        if self.session_fail_cooldown_s <= 0:
+            return False
+        if session_id not in self.failed_sessions:
+            return False
+        failed_at = self.session_failed_at.get(session_id)
+        if failed_at is None:
+            return False
+        return (time.time() - failed_at) >= self.session_fail_cooldown_s
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -717,6 +747,16 @@ class MooncakeKVManager(CommonKVManager):
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
+                            if self._session_cooldown_expired(req.mooncake_session_id):
+                                # Give it another chance rather than rejecting for the
+                                # rest of the run. If the peer really is dead the next
+                                # transfer fails and it trips straight back.
+                                self.failed_sessions.discard(req.mooncake_session_id)
+                                self.session_failures.pop(req.mooncake_session_id, None)
+                                logger.warning(
+                                    "Session %s: cooldown elapsed, retrying transfers.",
+                                    req.mooncake_session_id,
+                                )
                             if req.mooncake_session_id in self.failed_sessions:
                                 self.record_failure(
                                     kv_chunk.room,
@@ -774,11 +814,34 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                # Upstream trips on the first failure, on the reasoning
+                                # that a live session never fails. Under memory pressure
+                                # that is too strong: a transient error then costs every
+                                # later request on the pair. Threshold defaults to 1, so
+                                # this is upstream unless a run raises it.
+                                if (
+                                    self.session_failures[req.mooncake_session_id]
+                                    >= self.session_fail_threshold
+                                ):
                                     self.failed_sessions.add(req.mooncake_session_id)
+                                    self.session_failed_at[
+                                        req.mooncake_session_id
+                                    ] = time.time()
                                     logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
+                                        f"Session {req.mooncake_session_id} failed "
+                                        f"{self.session_failures[req.mooncake_session_id]} "
+                                        f"time(s); blacklisting"
+                                        + (
+                                            f" for {self.session_fail_cooldown_s}s."
+                                            if self.session_fail_cooldown_s > 0
+                                            else " permanently (no cooldown set)."
+                                        )
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Session {req.mooncake_session_id} failed "
+                                        f"{self.session_failures[req.mooncake_session_id]}/"
+                                        f"{self.session_fail_threshold}; still in use."
                                     )
                             self.record_failure(
                                 kv_chunk.room,
@@ -866,6 +929,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
+                        self.session_failed_at.pop(mooncake_session_id, None)
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
